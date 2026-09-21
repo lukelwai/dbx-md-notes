@@ -19,11 +19,42 @@ const EXE = path.join(ROOT, "backend/dbx-plugin-mdnotes.exe");
 const TMP = path.join(ROOT, "_e2e_tmp");
 const STORAGE_DIR = path.join(TMP, "storage");
 const DATA_DIR = path.join(TMP, "data");
+const SAVED_DIR = path.join(TMP, "saved");   // 模拟「用户在原生另存为对话框里选的目录」
 const BRIDGE_PAYLOAD_LIMIT = 2 * 1024 * 1024;
 
 fs.rmSync(TMP, { recursive: true, force: true });
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(SAVED_DIR, { recursive: true });
+
+/** 跨 realm 取字节：插件在 vm realm 里造 ArrayBuffer，host 侧 instanceof 判不出来 */
+function toU8(v) {
+  if (!v) return null;
+  if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  if (typeof v.byteLength === "number" && typeof v.slice === "function") return new Uint8Array(v);
+  return null;
+}
+
+/** 极简 zip 中央目录读取（只为断言包内条目名，不解析内容） */
+function zipEntries(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i >= buf.length - 22 - 65536; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("不是 zip：找不到 EOCD");
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error("中央目录签名不对 @" + off);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    out.push(buf.slice(off + 46, off + 46 + nameLen).toString("utf8"));
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
 
 /* ---------- 1) 从宿主源码抽出官方 SDK 源串 ---------- */
 function extractSdkSource() {
@@ -136,6 +167,19 @@ async function dispatch(req) {
   if (bytes > BRIDGE_PAYLOAD_LIMIT) throw new Error("Plugin bridge request is too large"); // 宿主同款限制
   const method = req.method;
   if (method === "host.getContext") return workbenchContext;
+  if (method === "host.saveFile") {
+    // 照 pluginHostBridge.ts 的 host.saveFile 分支：字节优先来自 transfer，其次 dataBase64
+    const input = req.params || {};
+    let data = toU8(req.data);
+    if (!data && typeof input.dataBase64 === "string") data = new Uint8Array(Buffer.from(input.dataBase64, "base64"));
+    if (!data) throw new Error("host.saveFile requires transferred binary data or dataBase64");
+    if (data.byteLength > 512 * 1024 * 1024) throw new Error("Plugin save payload exceeds 512 MiB");
+    // 这里代表「宿主弹原生对话框、用户选目录并确认」——直接用 fileName 落到 SAVED_DIR
+    const target = path.join(SAVED_DIR, String(input.fileName || "unnamed.bin"));
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, Buffer.from(data));
+    return { path: target };
+  }
   if (method === "backend.invoke") {
     const input = req.params || {};
     if (typeof input.method !== "string") throw new Error("backend.invoke params must include method");
@@ -160,6 +204,11 @@ function check(name, cond, extra) {
   check("侧车身份与 manifest 一致",
     init.plugin.id === manifest.id && init.plugin.version === manifest.version,
     `${init.plugin.id}@${init.plugin.version} vs ${manifest.id}@${manifest.version}`);
+
+  // 反面护栏：版本必须来自运行时读包内 manifest，不能是编译期常量（发版必漂移）
+  const ping = await sidecar("notes/ping", {});
+  check("侧车 ping 报的版本与 manifest 一致（防常量漂移）",
+    ping.version === manifest.version, `${ping.version} vs ${manifest.version}`);
 
   // 宿主连接流程：connection/connect 带 storage_dir（前端拿不到它，验证前端不依赖它）
   const conn = await sidecar("connection/connect", {
@@ -218,6 +267,68 @@ function check(name, cond, extra) {
   check("reload 回读到 2 个节点",
     !!(again.data && again.data.nodes && again.data.nodes.length === 2),
     "nodes=" + (again.data && again.data.nodes ? again.data.nodes.length : "null"));
+
+  /* ---------- 导出 / 备份：必须走宿主「另存为」，让用户自选目录 ---------- */
+  check("storage.js 识别到宿主 saveFile 能力", S.hasHostSave() === true);
+
+  const ex = await S.invoke("notes/exportNote", { id: "n1" });
+  check("导出默认返回字节、不自己写盘",
+    typeof ex.dataBase64 === "string" && ex.path === undefined, "fileName=" + ex.fileName);
+  const exr = await S.saveFile(ex.fileName, "text/markdown", ex.dataBase64);
+  check("导出走宿主另存为成功", exr.ok === true, exr.error);
+  const exPath = path.join(SAVED_DIR, "重构验证.md");
+  check("导出的 .md 落在「用户所选目录」", fs.existsSync(exPath), exPath);
+  if (fs.existsSync(exPath)) {
+    check("导出内容正确", fs.readFileSync(exPath, "utf8").includes("存储链路已打通"));
+  }
+
+  const bk = await S.invoke("notes/backup", {});
+  check("备份返回字节 + 配置（不写进存储目录）",
+    typeof bk.dataBase64 === "string" && bk.path === undefined && !!bk.storageDir && bk.count === 1,
+    `count=${bk.count} folders=${bk.folders} bytes=${bk.bytes}`);
+  const bkr = await S.saveFile(bk.fileName, "application/zip", bk.dataBase64);
+  check("备份走宿主另存为成功", bkr.ok === true, bkr.error);
+  const zipPath = path.join(SAVED_DIR, bk.fileName);
+  check("备份 zip 落在「用户所选目录」", fs.existsSync(zipPath), zipPath);
+
+  // 备份包里必须同时有「配置」和「目录树索引」，否则恢复出来只是一堆孤儿文件
+  const names = zipEntries(fs.readFileSync(zipPath));
+  check("备份包含配置 mdnotes-backup.json", names.includes("mdnotes-backup.json"), names.join(", "));
+  check("备份包含目录树索引 .mdnotes/meta.json", names.includes(".mdnotes/meta.json"));
+  check("备份包含正文", names.some((n) => n.endsWith("重构验证.md")));
+  check("备份条目名用正斜杠（不是 Windows 反斜杠）", !names.some((n) => n.includes("\\")));
+
+  /* ---------- 恢复：把备份灌回去 ---------- */
+  const b64 = fs.readFileSync(zipPath).toString("base64");
+  const dir = await S.invoke("notes/restore", { dataBase64: b64, dryRun: true });
+  check("恢复 dryRun 回报包内容",
+    dir.dryRun === true && dir.notes === 1 && dir.folders === 1,
+    `notes=${dir.notes} folders=${dir.folders} ver=${dir.backup && dir.backup.version}`);
+  check("dryRun 不改动磁盘", fs.existsSync(file));
+
+  // 先把现场搞坏（改名一篇笔记），再恢复，验证真的能回到备份时的状态
+  const broken = JSON.parse(JSON.stringify(snapshot));
+  broken.nodes[1].name = "被改坏的名字";
+  await S.save(broken, false);
+  const brokenPath = path.join(STORAGE_DIR, "工作/被改坏的名字.md");
+  check("现场已破坏（改名生效）", fs.existsSync(brokenPath), brokenPath);
+
+  const rst = await S.invoke("notes/restore", { dataBase64: b64 });
+  check("恢复成功", rst.ok === true);
+  check("恢复后原文件名回来了", fs.existsSync(file), file);
+  check("恢复前留下了退路快照",
+    !!rst.safetyPath && fs.existsSync(rst.safetyPath), rst.safetyPath || "(无)");
+
+  const after = await S.reload();
+  check("恢复后回读到 2 个节点",
+    !!(after.data && after.data.nodes && after.data.nodes.length === 2),
+    "nodes=" + (after.data && after.data.nodes ? after.data.nodes.length : "null"));
+  if (after.data && after.data.nodes) {
+    const n1 = after.data.nodes.find((n) => n.id === "n1");
+    check("恢复后笔记名与正文都复原",
+      !!n1 && n1.name === "重构验证" && String(n1.content || "").includes("存储链路已打通"),
+      n1 ? n1.name : "(找不到 n1)");
+  }
 
   console.log("\n===== 通过 " + pass.length + " 项 =====");
   pass.forEach((p) => console.log("  PASS  " + p));

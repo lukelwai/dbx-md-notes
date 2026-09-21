@@ -145,6 +145,29 @@
     S.save(snapshot(), debounce !== false);
   }
 
+  /**
+   * 把「载入结果」套用到 state，成功返回 true。
+   *
+   * 坑：S.init() / S.reload() resolve 的是 {data:{nodes,...}, firstRun, ...}，
+   * 笔记数据在 .data 这一层，不在顶层。取错层会静默失败（守卫条件不成立），
+   * 于是「换存储目录」或「恢复备份」后界面仍显示旧状态，而紧接着的那次
+   * persist 又把旧状态写回磁盘 —— 等于把刚写好的结果原地抹掉。
+   */
+  function applyLoaded(res) {
+    var d = (res && res.data) ? res.data : res;
+    if (!d || Object.prototype.toString.call(d.nodes) !== "[object Array]") { return false; }
+    state.nodes = d.nodes;
+    state.activeId = d.activeId || null;
+    state.expanded = d.expanded || {};
+    if (d.view) { setView(d.view); }
+    if (state.activeId && !byId(state.activeId)) { state.activeId = null; }
+    if (!state.activeId) {
+      var firsts = state.nodes.filter(function (n) { return n.type === "note"; });
+      if (firsts.length) { state.activeId = firsts[0].id; }
+    }
+    return true;
+  }
+
   // ---------------- 图标 ----------------
   var ICONS = {
     folder: '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
@@ -324,7 +347,10 @@
     row.className = "node" + (n.id === state.activeId ? " active" : "");
     row.setAttribute("data-id", n.id);
     row.setAttribute("data-type", n.type);
-    row.setAttribute("draggable", "true");
+    // 这里【绝对不能】写 draggable="true"：
+    // 目录树的拖拽是上面用指针事件自实现的；一旦元素可原生拖拽，浏览器会在拖到几像素时
+    // 抢走手势 → 触发原生 HTML5 拖拽 → 随即发 pointercancel 掐断我们的 pointermove，
+    // 结果就是「拖不动 + 一路禁止光标」。2026-09-21 的实际事故正是这一行遗留属性。
     row.style.paddingLeft = (8 + depth * 14) + "px";
 
     var tw = document.createElement("span");
@@ -469,6 +495,14 @@
   document.addEventListener("pointermove", pdragMove);
   document.addEventListener("pointerup", pdragEnd);
   document.addEventListener("pointercancel", pdragEnd);
+
+  // 兜底闸门：任何情况下都不允许原生 HTML5 拖拽接管目录树。
+  // 原生拖拽一旦启动会立刻发 pointercancel 掐断指针拖拽，并显示禁止光标 —— 加这一层
+  // 是为了让「日后有人再加回 draggable / 或从别处拖入元素」也不会把拖拽功能搞死。
+  document.addEventListener("dragstart", function (e) {
+    var t = e.target;
+    if (t && t.closest && t.closest("#tree")) { e.preventDefault(); }
+  });
 
   function renderTree() {
     var tree = $("tree");
@@ -764,12 +798,15 @@
       }
       acts.push({ text: "复制诊断报告", onClick: function () { copyText(S.report(), "诊断报告"); } });
       acts.push({ text: "立即备份", onClick: function () { closeModal(); backupAll(); } });
+      acts.push({ text: "从备份恢复…", onClick: function () { closeModal(); restoreFlow(); } });
       acts.push({ text: "关闭", primary: true, onClick: closeModal });
       modalButtons(card, acts);
     });
   }
 
-  // ---------------- 侧栏底部：存储位置 + 统计 ----------------
+  // ---------------- 侧栏底部：统计 ----------------
+  // 这里不再显示存储位置：存储状态弹窗（点状态栏）是唯一权威出口，
+  // 同一信息两处显示只会出现「两处不一致、用户不知道该信哪个」。
   function renderSideFoot() {
     var foot = $("side-foot");
     if (!foot) { return; }
@@ -778,7 +815,6 @@
     state.nodes.forEach(function (n) {
       if (n.type === "note") { totalNotes++; } else { totalFolders++; }
     });
-    var path = st.storageDir || st.storagePath || "";
     foot.textContent = "";
 
     var stat = document.createElement("div");
@@ -787,20 +823,13 @@
       '<span class="foot-num">' + totalFolders + '</span> 个文件夹';
     foot.appendChild(stat);
 
-    if (path) {
-      var loc = document.createElement("div");
-      loc.className = "foot-loc";
-      loc.title = "笔记存储目录：" + path;
-      loc.innerHTML = '<span class="foot-ico">📁</span><span class="foot-path"></span>';
-      loc.querySelector(".foot-path").textContent = path;
-      foot.appendChild(loc);
-    }
-
     // 未配置 storage_dir 时给出醒目提示：笔记其实写进了插件默认目录，用户看不到 → 误以为没存储。
+    // 注意这里只说「去哪看」，不重复贴路径（状态弹窗里有）。
     if (st.backend === "sidecar" && st.dirConfigured === false) {
       var warn = document.createElement("div");
       warn.className = "foot-warn";
-      warn.textContent = "未配置「笔记存储目录」：笔记暂存在上式路径。请在连接设置填写后重新连接。";
+      warn.textContent = "未配置「笔记存储目录」：笔记暂存在插件默认目录，在你自己的文件夹里看不到。"
+        + "请在连接设置里填写后重新连接（点状态栏可看详情）。";
       foot.appendChild(warn);
     }
   }
@@ -813,15 +842,7 @@
         return null;
       }
       return S.reload().then(function (data) {
-        if (data && Object.prototype.toString.call(data.nodes) === "[object Array]" && data.nodes.length) {
-          state.nodes = data.nodes;
-          state.activeId = data.activeId || null;
-          state.expanded = data.expanded || {};
-          if (state.activeId && !byId(state.activeId)) { state.activeId = null; }
-          if (!state.activeId) {
-            var firsts = state.nodes.filter(function (n) { return n.type === "note"; });
-            if (firsts.length) { state.activeId = firsts[0].id; }
-          }
+        if (applyLoaded(data) && state.nodes.length) {
           render();
           persist(false);
           toast("已载入本地目录中的笔记：" + r.name);
@@ -955,6 +976,8 @@
       item("新建笔记", function () { createNote("未命名笔记", null, ""); });
       item("新建文件夹", function () { newFolderFlow(null); });
       item("导入 .md 文件", function () { $("file-input").click(); });
+      item("备份全部为 zip", backupAll);
+      item("从备份恢复…", restoreFlow);
     } else if (n.type === "folder") {
       item("新建笔记", function () { createNote("未命名笔记", n.id, ""); });
       item("新建子文件夹", function () { newFolderFlow(n.id); });
@@ -991,31 +1014,115 @@
     });
   }
 
-  // ---------------- 导入 / 导出 ----------------
-  // 说明：插件跑在 sandbox iframe 中，浏览器下载（a.download）被宿主静默拦截，弹不出文件框。
-  // 因此导出/备份统一走侧车后端，把文件真正写到「笔记存储目录」下，并把完整路径回显给用户。
+  // ---------------- 导入 / 导出 / 备份 / 恢复 ----------------
+  //
+  // 落盘有两条通道，优先级从高到低：
+  //   1. 宿主原生「另存为」（dbxPlugin.saveFile）—— 由宿主弹系统保存对话框，用户自己选目录和文件名。
+  //      沙箱 iframe 里没有磁盘权限，a.download / blob 导航会被宿主静默取消，所以只能借宿主之手。
+  //   2. 侧车写进「笔记存储目录」（toDisk=true）—— 宿主没有 saveFile 能力时的兜底，路径回显给用户。
+  //
+  // 备份必须包含配置：mdnotes-backup.json（版本/时间/原存储目录/计数）+ .mdnotes/meta.json（目录树索引）
+  // + 全部正文 .md。只备份正文而不备份索引，恢复出来就是一堆没有名字和层级的孤儿文件。
+
+  function merge(o, extra) {
+    var out = {}, k;
+    for (k in (o || {})) { if (Object.prototype.hasOwnProperty.call(o, k)) { out[k] = o[k]; } }
+    for (k in (extra || {})) { if (Object.prototype.hasOwnProperty.call(extra, k)) { out[k] = extra[k]; } }
+    return out;
+  }
+
+  function mimeOf(name) {
+    var s = String(name || "").toLowerCase();
+    if (/\.zip$/.test(s)) { return "application/zip"; }
+    if (/\.md$/.test(s)) { return "text/markdown"; }
+    if (/\.txt$/.test(s)) { return "text/plain"; }
+    return "application/octet-stream";
+  }
+
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) { return n + " B"; }
+    if (n < 1024 * 1024) { return (n / 1024).toFixed(1) + " KB"; }
+    return (n / 1024 / 1024).toFixed(2) + " MB";
+  }
+
+  /** 让侧车产出字节，再交给用户：优先宿主「另存为」（自选目录），否则回退写进存储目录 */
+  function saveViaSidecar(method, params, what, linesFn) {
+    if (!S.hasHostSave()) {
+      return S.invoke(method, merge(params, { toDisk: true })).then(function (d) {
+        showPathModal("已" + what + "到笔记存储目录", d.path);
+      }).catch(function (e) {
+        toast(what + "失败：" + (e && e.message ? e.message : e), "warn");
+      });
+    }
+    return S.invoke(method, params).then(function (r) {
+      var name = r.fileName || ("md-notes" + (method.indexOf("backup") >= 0 ? ".zip" : ".md"));
+      return S.saveFile(name, mimeOf(name), r.dataBase64).then(function (res) {
+        if (res.canceled) { toast("已取消" + what); return; }
+        if (res.ok) { showSavedModal("已" + what, res.path || name, linesFn ? linesFn(r) : null); return; }
+        toast("「另存为」不可用（" + res.error + "），改为写入笔记存储目录", "warn");
+        return S.invoke(method, merge(params, { toDisk: true })).then(function (d) {
+          showPathModal("已" + what + "到笔记存储目录", d.path);
+        });
+      });
+    }).catch(function (e) {
+      toast(what + "失败：" + (e && e.message ? e.message : e), "warn");
+    });
+  }
+
   function exportNote(n) {
     if (!n) { toast("请先选择一条笔记", "warn"); return; }
-    S.invoke("notes/exportNote", { id: n.id }).then(function (r) {
-      showPathModal("已导出笔记", r.path);
-    }).catch(function (e) {
-      toast("导出失败：" + (e && e.message ? e.message : e), "warn");
-    });
+    return saveViaSidecar("notes/exportNote", { id: n.id }, "导出笔记");
   }
   function exportFolder(folder) {
-    S.invoke("notes/backup", { scope: folder.id }).then(function (r) {
-      showPathModal("已导出文件夹备份", r.path);
-    }).catch(function (e) {
-      toast("导出失败：" + (e && e.message ? e.message : e), "warn");
-    });
+    if (!folder) { toast("请先选择一个文件夹", "warn"); return; }
+    return saveViaSidecar("notes/backup", { scope: folder.id }, "备份文件夹", backupLines);
   }
   function backupAll() {
-    S.invoke("notes/backup", {}).then(function (r) {
-      showPathModal("已备份全部笔记", r.path);
-    }).catch(function (e) {
-      toast("备份失败：" + (e && e.message ? e.message : e), "warn");
+    return saveViaSidecar("notes/backup", {}, "备份全部笔记", backupLines);
+  }
+
+  /** 备份成功后把「包里装了什么」摊开说 —— 「含配置」必须看得见，否则没人知道它能用来恢复。 */
+  function backupLines(r) {
+    var lines = [
+      "包含：" + (r.count || 0) + " 篇笔记 · " + (r.folders || 0) + " 个文件夹",
+      "已含配置：mdnotes-backup.json（版本 / 导出时间 / 原存储目录）",
+      "　　　　　.mdnotes/meta.json（目录树索引，恢复出层级和标题靠它）",
+      "包体积：" + fmtBytes(r.bytes)
+    ];
+    if (r.storageDir) { lines.push("原存储目录：" + r.storageDir); }
+    lines.push("");
+    lines.push("要恢复：工具栏「恢复备份…」选中这个 zip 即可。");
+    return lines;
+  }
+
+  /** 已保存到用户所选目录的弹窗 */
+  function showSavedModal(title, path, extraLines, actions) {
+    openModal(function (card) {
+      var h = document.createElement("h3"); h.textContent = title; card.appendChild(h);
+      var p = document.createElement("p");
+      p.className = "m-msg";
+      p.textContent = "已保存到你选择的目录：";
+      card.appendChild(p);
+      var ta = document.createElement("textarea");
+      ta.className = "m-text";
+      ta.value = path || "";
+      ta.readOnly = true;
+      card.appendChild(ta);
+      if (extraLines && extraLines.length) {
+        var pre = document.createElement("pre");
+        pre.className = "m-pre";
+        pre.textContent = extraLines.join("\n");
+        card.appendChild(pre);
+      }
+      var acts = [];
+      if (path) { acts.push({ text: "复制路径", onClick: function () { copyText(path, "文件路径"); } }); }
+      (actions || []).forEach(function (a) { acts.push(a); });
+      acts.push({ text: "关闭", primary: !actions || !actions.length, onClick: closeModal });
+      modalButtons(card, acts);
     });
   }
+
   function showPathModal(title, path) {
     openModal(function (card) {
       var h = document.createElement("h3"); h.textContent = title; card.appendChild(h);
@@ -1032,6 +1139,86 @@
         { text: "关闭", onClick: closeModal },
         { text: "复制路径", primary: true, onClick: function () { copyText(path, "导出路径"); } }
       ]);
+    });
+  }
+
+  /** 简单确认框（恢复这种破坏性操作必须先问一句） */
+  function confirmModal(title, lines, okText) {
+    return new Promise(function (resolve) {
+      var done = function (v) { closeModal(); resolve(v); };
+      openModal(function (card) {
+        var h = document.createElement("h3"); h.textContent = title; card.appendChild(h);
+        var pre = document.createElement("pre");
+        pre.className = "m-pre";
+        pre.textContent = lines.join("\n");
+        card.appendChild(pre);
+        modalButtons(card, [
+          { text: "取消", onClick: function () { done(false); } },
+          { text: okText || "确定", primary: true, onClick: function () { done(true); } }
+        ]);
+      });
+    });
+  }
+
+  // ---------------- 从备份恢复 ----------------
+
+  function restoreFlow() {
+    var inp = $("backup-input");
+    if (!inp) { toast("恢复入口不可用", "warn"); return; }
+    inp.value = "";
+    inp.click();
+  }
+
+  function handleRestoreFile(files) {
+    var f = files && files[0];
+    if (!f) { return; }
+    // 宿主对 request 参数有 2 MiB 上限，base64 之后能带上行的 zip 约 1.5 MB。
+    // 超过就明确拒绝并给替代方案，而不是让它失败在一个看不懂的报错上。
+    if (f.size > S.MAX_UPSTREAM_BYTES) {
+      toast("备份包太大（" + fmtBytes(f.size) + " > 上限 " + fmtBytes(S.MAX_UPSTREAM_BYTES)
+        + "）：请手动解压后把 .md 放回存储目录", "warn");
+      return;
+    }
+    var b64 = "";
+    S.readFileAsBase64(f).then(function (v) {
+      b64 = v;
+      return S.invoke("notes/restore", { dataBase64: b64, dryRun: true });
+    }).then(function (r) {
+      var bi = r.backup || {};
+      var lines = [
+        "备份文件：" + f.name + "（" + fmtBytes(f.size) + "）",
+        "备份时间：" + (bi.exportedAt || "（未记录）"),
+        "插件版本：" + (bi.version || "（未记录）"),
+        "备份时存储目录：" + (bi.storageDir || "（未记录）"),
+        "包含：" + r.notes + " 篇笔记 · " + r.folders + " 个文件夹",
+        "",
+        "将写入当前存储目录：" + r.storageDir,
+        "同名笔记会被覆盖，目录树索引会被替换为备份时的状态。",
+        "恢复前会自动另存一份 pre-restore-*.zip 作为退路。"
+      ];
+      return confirmModal("确认恢复？", lines, "开始恢复");
+    }).then(function (ok) {
+      if (!ok) { toast("已取消恢复"); return null; }
+      // 恢复前先把挂起的防抖写落定，避免「恢复完成」之后又被那一帧旧快照覆盖。
+      return S.flush().then(function () {
+        return S.invoke("notes/restore", { dataBase64: b64 });
+      }).then(function (r) {
+        return S.reload().then(function (data) {
+          applyLoaded(data);
+          render();
+          persist(false);
+          var lines = [
+            "已恢复 " + r.notes + " 篇笔记 · " + r.folders + " 个文件夹",
+            "存储目录：" + r.storageDir
+          ];
+          lines.push(r.safetyPath
+            ? ("恢复前的快照（退路）：" + r.safetyPath)
+            : "（恢复前没有笔记，无需快照）");
+          showSavedModal("恢复完成", r.storageDir, lines);
+        });
+      });
+    }).catch(function (e) {
+      toast("恢复失败：" + (e && e.message ? e.message : e), "warn");
     });
   }
   function handleImport(files) {
@@ -1264,6 +1451,7 @@
     click("btn-export-md", function () { exportNote(activeNote()); });
     click("btn-import-md", function () { var fi = $("file-input"); if (fi) { fi.click(); } });
     click("btn-backup-zip", backupAll);
+    click("btn-restore-zip", restoreFlow);
 
     click("tn-cancel", closeTableModal);
     click("tn-ok", submitTableModal);
@@ -1274,6 +1462,11 @@
 
     on("file-input", "onchange", function (e) {
       handleImport(e.target.files);
+      e.target.value = "";
+    });
+
+    on("backup-input", "onchange", function (e) {
+      handleRestoreFile(e.target.files);
       e.target.value = "";
     });
 

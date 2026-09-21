@@ -19,19 +19,26 @@
 所以本插件的后端优先级是：
 
 ```
-sidecar（invoke → Go 侧车 → notes.json 落盘到你指定的目录）
-  → localStorage（本地浏览器预览时的兜底）
-  → sessionStorage
-  → memory（明确告警，不假装成功）
+sidecar（invoke → Go 侧车 → 真实 .md 文件 + 索引落盘到你指定的目录）
+  → memory（明确告警「不会落盘」，绝不假装成功）
 ```
+
+> 沙箱里 `localStorage` 也不可用，而且**刻意不做静默退化**：退化会让故障表现成
+> 「这次能存、下次打开就没了」这种最难查的形态。存储不可持久化时，界面直接告诉你。
 
 `storage.js` 里额外做了 **opaque origin 探测**：只有在非沙箱环境才会显示「选择笔记目录…」按钮，
 因此在 DBX 里不会再出现一个点了必报错的按钮。
 
 ### 笔记存在哪
 
-在「新建连接 → MD 笔记」表单里填 **`笔记存储目录`**（必填），侧车会把笔记写成该目录下的
-`notes.json`（临时文件 + rename 原子替换）。同时它也会把目录记住（`config.json`），下次启动直接复用。
+在「新建连接 → MD 笔记」表单里填 **`笔记存储目录`**（必填）。笔记是**存储目录下的真实文件**：
+每篇笔记一个 `.md`，每个文件夹一个真实子目录；目录树索引单独放在 `<存储目录>/.mdnotes/meta.json`
+（只存层级/标题/顺序，不含正文，正文永远以 `.md` 为准）。
+侧车写盘一律「临时文件 + rename」原子替换，并把目录记住（`config.json`），下次启动直接复用。
+
+导出、备份都走宿主的原生「另存为」对话框，**目录和文件名由你自己选**；
+备份包是个 zip，除正文外还带 `mdnotes-backup.json`（版本 / 导出时间 / 原存储目录）和
+`.mdnotes/meta.json`（目录树层级），所以可以从备份一键恢复出原来的层级和标题。
 
 ---
 
@@ -73,14 +80,29 @@ dbx-md-notes/
 ├── ui/
 │   ├── index.html
 │   ├── styles.css
-│   ├── app.js               # 目录树、编辑器/预览、搜索、主题、表联动、导入导出
+│   ├── app.js               # 目录树（含指针拖拽）、编辑器/预览、搜索、主题、表联动、导入导出/备份恢复
 │   ├── markdown.js          # Markdown 渲染（无依赖）
 │   ├── sql-highlight.js     # SQL 语法高亮
 │   └── storage.js           # 存储层：sidecar 优先，失败必上抛
-└── backend/
-    ├── go.mod               # module github.com/example/mdnotes，零外部依赖
-    ├── main.go
-    └── dbxsdk/              # 官方 Go SDK 原样 vendor（见 dbxsdk/VENDOR.md）
+├── backend/
+│   ├── go.mod               # module github.com/example/mdnotes，零外部依赖
+│   ├── main.go
+│   ├── main_test.go         # 备份/恢复往返、路径穿越拒绝、哈希缓存 等单测
+│   └── dbxsdk/              # 官方 Go SDK 原样 vendor（见 dbxsdk/VENDOR.md）
+├── dist/                    # 打包产物 *.dbxp（不进版本控制）
+└── _*.{js,mjs,py}           # 验证工具链（`_` 前缀，不进包，见下）
+```
+
+### 验证工具链
+
+改动前端或打包相关代码后，按顺序跑这四层（**只测后端测不出桥接 bug，只测桥接测不出"界面启动即死"**）：
+
+```bash
+node _domcheck.py           # 1) 静态：DOM 引用悬空 / 关键元素缺失
+node _buildpkg.js           # 2) 打包（内建四道自检 + 精确 checksums）
+node _verify.mjs            # 3) 包结构 + sha256 + 关键代码标记
+node _e2e_bridge.mjs        # 4a) 桥接级：官方 SDK 源串 + 真实 storage.js + 真实侧车
+node _e2e_ui.mjs            # 4b) UI 级：真实 index.html 跑在 jsdom 里（需 jsdom）
 ```
 
 ### 为什么要 vendor 官方 SDK
@@ -104,8 +126,11 @@ SDK 负责三件容易写错的事：`plugin/initialize` 必须返回
 | `connection/test` | 校验存储目录可写，返回将写入的路径 |
 | `connection/connect` / `disconnect` | 连接生命周期；`connect` 会从连接配置里吸收 `storage_dir` |
 | `notes/ping` | 前端握手探测（确认侧车真的活着） |
-| `notes/load` | 返回 `{data, path, dir, pending}`，`pending` 是右键「为此表新建笔记」的待处理上下文，取走即清空 |
-| `notes/save` | 写 `notes.json`（原子替换） |
+| `notes/load` | 返回 `{data, path, dir, pending}`，`pending` 是右键「为此表新建笔记」的待处理上下文，取走即清空。**注意 `data` 是外壳**：笔记内容在 `data.nodes` |
+| `notes/save` | 把正文写成 `.md`（内容未变则按 SHA-256 缓存跳过）+ 原子替换索引 `.mdnotes/meta.json` |
+| `notes/exportNote` | 导出单篇。默认返回 `{fileName, dataBase64}`（交宿主「另存为」）；`toDisk:true` 才写进存储目录 |
+| `notes/backup` | 备份为 zip。默认返回字节；`toDisk:true` 才写盘。包内含正文 + `mdnotes-backup.json` + `.mdnotes/meta.json` |
+| `notes/restore` | 从备份 zip 恢复（`dryRun` 只回报）。拒绝路径穿越、拒绝非本插件备份，恢复前自动存 `pre-restore-*.zip` 快照 |
 | `notes/setDir` / `notes/path` | 手动指定 / 查询目录 |
 | `filesystem/list|read|write|createDirectory|delete|rename` | 把笔记树投影成 `mdnotes://` 虚拟文件系统 |
 | `contextMenu/com.example.mdnotes.newNoteForTable` | 记录表上下文到 `pending` |

@@ -17,3 +17,5 @@ bin/
 .dbx-dev/
 frontend/.pnpm-store/
 .zcode/
+_e2e_tmp
+_e2e_ui_tmp

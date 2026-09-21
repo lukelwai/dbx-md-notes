@@ -56,7 +56,7 @@
 
   /* ============ 诊断日志（页面置顶诊断条 + 状态弹窗共用，实时刷新） ============ */
 
-  var UI_VERSION = "0.5.5";   // 打包脚本会校验它与 manifest.version 一致
+  var UI_VERSION = "0.6.0";   // 打包脚本会校验它与 manifest.version 一致
   var T0 = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
   /** 自模块加载起的毫秒数（给每条日志打上相对时间，能看出卡在哪一步） */
   function since() {
@@ -622,6 +622,79 @@
     };
   }
 
+  /* ================== 宿主「另存为」：让用户自己选目录 ==================
+   * 为什么必须走宿主而不是 a.download：插件 UI 跑在 opaque origin 的 sandbox iframe 里，
+   * blob 导航/下载会被宿主无声取消（WKWebView 直接 cancel），前端点不动任何下载。
+   * 宿主提供的 host.saveFile 由它自己弹【原生保存对话框】并写盘 —— 用户可选目录和文件名。
+   *
+   * 传输方式（宿主源码 apps/desktop/src/lib/plugins/pluginHostBridge.ts · host.saveFile）：
+   *   - 传 Uint8Array / ArrayBuffer → postMessage 以 transfer 零拷贝送出，上限 512 MiB；
+   *   - 传 base64 字符串          → 作为请求参数走 JSON，受 2 MiB 参数上限约束（约合 1.5 MB 文件）。
+   * 所以一律传 ArrayBuffer，且必须是【长度精确】的 buffer —— SDK 里
+   * `data instanceof Uint8Array ? data.buffer : …` 会把整个 underlying buffer 送走，
+   * 若递过去的是大 buffer 上的一个视图，落盘内容会多出一截垃圾。
+   */
+
+  /** 宿主对 request 参数有 2 MiB 上限（enforcePayloadLimit）→ 上行文件（如恢复备份）要守住这个量级 */
+  var MAX_UPSTREAM_BYTES = 1500 * 1000;
+
+  function base64ToBytes(b64) {
+    var bin = atob(String(b64 || "").replace(/\s+/g, ""));
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { out[i] = bin.charCodeAt(i) & 0xff; }
+    return out;
+  }
+
+  /** 得到「长度精确」的 ArrayBuffer（见上方注释：视图会被整个 buffer 送走） */
+  function toExactBuffer(v) {
+    if (v instanceof ArrayBuffer) { return v; }
+    var u8;
+    if (typeof v === "string") { u8 = base64ToBytes(v); }
+    else if (v instanceof Uint8Array) { u8 = v; }
+    else { u8 = new Uint8Array(v || 0); }
+    if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength) { return u8.buffer; }
+    var copy = new Uint8Array(u8.byteLength);
+    copy.set(u8);
+    return copy.buffer;
+  }
+
+  function hasHostSave() {
+    return !!(api && typeof api.saveFile === "function");
+  }
+
+  /** 弹宿主原生「另存为」，把字节写到用户选的目录。返回 {ok, canceled, path, error} */
+  function hostSaveFile(fileName, contentType, bytes) {
+    if (!hasHostSave()) {
+      note("宿主 saveFile", false, "当前宿主没有 saveFile 能力，无法弹出保存对话框");
+      return Promise.resolve({
+        ok: false, canceled: false, path: "",
+        error: "当前 DBX 宿主不支持「另存为」对话框"
+      });
+    }
+    var buf, size = 0;
+    try {
+      buf = toExactBuffer(bytes);
+      size = buf.byteLength;
+    } catch (e) {
+      note("宿主 saveFile", false, "字节准备失败：" + errText(e));
+      return Promise.resolve({ ok: false, canceled: false, path: "", error: errText(e) });
+    }
+    var opts = { fileName: fileName, contentType: contentType };
+    return Promise.resolve(api.saveFile(opts, buf)).then(function (res) {
+      // 宿主文档：用户取消时 resolve null
+      if (res === null || res === undefined) {
+        note("宿主 saveFile", null, "用户取消了保存：" + fileName);
+        return { ok: false, canceled: true, path: "", error: "已取消" };
+      }
+      var p = (res && typeof res.path === "string") ? res.path : "";
+      note("宿主 saveFile", true, fileName + "（" + size + " B）-> " + (p || "(宿主未回传路径)"));
+      return { ok: true, canceled: false, path: p, error: "" };
+    }).catch(function (e) {
+      note("宿主 saveFile", false, fileName + "：" + errText(e));
+      return { ok: false, canceled: false, path: "", error: errText(e) };
+    });
+  }
+
   /* ============================ 对外 API ============================ */
 
   var Store = {
@@ -733,6 +806,15 @@
       return rpc(method, params, RPC_TIMEOUT);
     },
 
+    /** 宿主是否提供「另存为」对话框（决定导出/备份能否让用户自选目录） */
+    hasHostSave: hasHostSave,
+
+    /** 弹宿主原生「另存为」，把字节写到用户选的目录 */
+    saveFile: hostSaveFile,
+
+    /** 上行（前端 → 侧车）单次文件大小上限，见 MAX_UPSTREAM_BYTES 注释 */
+    MAX_UPSTREAM_BYTES: MAX_UPSTREAM_BYTES,
+
     /** 写入。debounce=true 时合并短时间内的多次写入 */
     save: function (data, debounce) {
       if (debounce) {
@@ -745,6 +827,10 @@
     },
 
     writeNow: function (data) {
+      // 直接写盘必须取消挂起的防抖写：否则更早排队的旧快照会在 400ms 后落盘，
+      // 把这次（更新的）写入覆盖掉。恢复备份时曾因此把恢复结果整片盖回旧状态。
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      pendingData = null;
       if (!current) { current = memoryBackend(); }
       var target = current;
       return Promise.resolve().then(function () {
@@ -797,6 +883,23 @@
         r.onload = function () { resolve(String(r.result)); };
         r.onerror = function () { reject(r.error || new Error("读取文件失败")); };
         r.readAsText(file);
+      });
+    },
+
+    /** 读本地文件为 base64（恢复备份用：zip 是二进制，不能按文本读） */
+    readFileAsBase64: function (file) {
+      return new Promise(function (resolve, reject) {
+        var r = new FileReader();
+        r.onload = function () {
+          var u8 = new Uint8Array(r.result);
+          var s = "";
+          for (var i = 0; i < u8.length; i += 0x8000) {
+            s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+          }
+          resolve(btoa(s));
+        };
+        r.onerror = function () { reject(r.error || new Error("读取文件失败")); };
+        r.readAsArrayBuffer(file);
       });
     },
 

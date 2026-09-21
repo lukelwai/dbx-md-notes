@@ -32,12 +32,49 @@ const EXE = path.join(ROOT, "backend/dbx-plugin-mdnotes.exe");
 const TMP = path.join(ROOT, "_e2e_ui_tmp");
 const STORAGE_DIR = path.join(TMP, "storage");
 const DATA_DIR = path.join(TMP, "data");
+const SAVED_DIR = path.join(TMP, "saved");   // 模拟「用户在原生另存为对话框里选的目录」
 const BRIDGE_PAYLOAD_LIMIT = 2 * 1024 * 1024;
 const CONN_ID = "e2e-ui-conn-1";
 
 fs.rmSync(TMP, { recursive: true, force: true });
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(SAVED_DIR, { recursive: true });
+
+/** 递归找某个文件名，返回绝对路径 */
+function findPath(root, name) {
+  for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+    const fp = path.join(root, e.name);
+    if (e.isDirectory()) {
+      const hit = findPath(fp, name);
+      if (hit) return hit;
+    } else if (e.name === name) {
+      return fp;
+    }
+  }
+  return "";
+}
+
+/** 极简 zip 中央目录读取（只为断言包内条目名） */
+function zipEntries(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i >= buf.length - 22 - 65536; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("不是 zip：找不到 EOCD");
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error("中央目录签名不对 @" + off);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    out.push(buf.slice(off + 46, off + 46 + nameLen).toString("utf8"));
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
 
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
 
@@ -95,6 +132,25 @@ function installBridge(window) {
   let resolveReady;
   const ready = new Promise((r) => { resolveReady = r; });
 
+  // 模拟宿主原生「另存为」：把字节写到 SAVED_DIR（= 用户选定的目录），返回 {path}
+  const saveCalls = [];
+  function hostSaveFile(options, data) {
+    if (data === null || data === undefined) return null; // 宿主在用户取消时 resolve null
+    let u8;
+    try { u8 = new Uint8Array(data); } catch { throw new Error("host.saveFile requires binary data"); }
+    const name = String((options && options.fileName) || "unnamed.bin");
+    const target = path.join(SAVED_DIR, name);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, Buffer.from(u8));
+    saveCalls.push({
+      fileName: name,
+      contentType: (options && options.contentType) || "",
+      bytes: u8.byteLength,
+      path: target,
+    });
+    return Promise.resolve({ path: target });
+  }
+
   const api = {
     ready,
     // 真实 SDK：ready 的值是【上下文数据】，且 context 是同步可读的
@@ -110,6 +166,7 @@ function installBridge(window) {
       ]);
     },
     request(method, params) { return hostDispatch(method, params); },
+    saveFile: hostSaveFile,
     notify() {},
     onContext(fn) { ctxListeners.push(fn); },
     onInit(fn) { ctxListeners.push(fn); },
@@ -123,6 +180,7 @@ function installBridge(window) {
   window.document.execCommand = () => false;
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   window.__hostLog = hostLog;
+  window.__saveCalls = saveCalls;
   window.__testErrors = [];
   window.addEventListener("error", (e) => window.__testErrors.push(String(e.message || e)));
 }
@@ -270,6 +328,191 @@ check("诊断日志仍完整保留在存储层（只是不上屏）",
   diagLines().slice(-2).join(" ;; "));
 check("历史诊断入口未泄漏到页面（无 diag-toggle/复制诊断按钮）",
   !$("diag-toggle") && !$("diag-copy") && !$("diag-detail"));
+
+/* ---------- 9) 侧栏底部不再重复显示存储位置（存储状态弹窗是唯一出口） ---------- */
+check("侧栏底部不再显示存储路径（.foot-loc 已移除）",
+  !$("side-foot").querySelector(".foot-loc")
+    && !$("side-foot").textContent.includes(STORAGE_DIR),
+  JSON.stringify($("side-foot").textContent));
+check("侧栏底部仍保留统计信息（不是整块被删掉）",
+  /篇笔记/.test($("side-foot").textContent) && !!$("side-foot").querySelector(".foot-stat"),
+  $("side-foot").textContent);
+
+/* ---------- 10) 目录树拖拽（本次报障点之一：拖不动） ---------- */
+// 根因：rowEl 里遗留 draggable="true" → 元素可原生拖拽 → 浏览器抢走手势、发 pointercancel
+// 掐断指针拖拽，并显示禁止光标。先做 DOM 级护栏，再真正模拟一次「把笔记拖进文件夹」。
+const fire = (el, type, props) => {
+  const ev = new window.Event(type, { bubbles: true, cancelable: true });
+  Object.assign(ev, props || {});
+  el.dispatchEvent(ev);
+  return ev;
+};
+
+const initialNodes = [...doc.querySelectorAll("#tree .node")];
+check("目录树里有节点（前置条件）", initialNodes.length > 0, "节点数=" + initialNodes.length);
+check("目录树节点都不再声明 draggable（否则原生拖拽会掐掉指针拖拽）",
+  initialNodes.every((el) => !el.hasAttribute("draggable")),
+  initialNodes.map((el) => el.getAttribute("draggable")).join(",") || "（都没有，正确）");
+check("目录树节点都带 data-id（拖拽靠它算落点）",
+  initialNodes.every((el) => !!el.getAttribute("data-id")));
+{
+  const cssText = fs.readFileSync(path.join(ROOT, "ui/styles.css"), "utf8");
+  check(".drag-ghost 有 pointer-events:none（否则命中测试会打到幽灵自己）",
+    /\.drag-ghost\s*\{[^}]*pointer-events:\s*none/.test(cssText));
+  check(".node 有 touch-action:none（防止指针被滚动手势抢走）",
+    /\.node\s*\{[^}]*touch-action:\s*none/.test(cssText));
+}
+
+// jsdom 没有布局，elementFromPoint 不可用；替换成「坐标 → 测试指定的元素」。
+// 这样测的是我们自己的拖拽状态机，而不是浏览器的命中测试。
+let hitEl = null;
+doc.elementFromPoint = () => hitEl;
+
+// 建一个文件夹当拖拽目标
+const FOLDER_NAME = "拖拽目标目录";
+$("btn-new-folder").click();
+await sleep(50);
+const folderInput = $("modal") && $("modal").querySelector("input");
+check("「新建文件夹」弹窗能打开", !!folderInput);
+if (folderInput) {
+  folderInput.value = FOLDER_NAME;
+  [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "创建").click();
+  await sleep(700);
+}
+const folderRow = [...doc.querySelectorAll("#tree .node")].find(
+  (el) => el.getAttribute("data-type") === "folder" && el.textContent.includes(FOLDER_NAME));
+check("文件夹已出现在目录树", !!folderRow,
+  [...doc.querySelectorAll("#tree .node")].map((e) => e.textContent).join(" | "));
+
+// 目标笔记：第 6 节刚在根目录建的「未命名笔记」
+const dragRow = [...doc.querySelectorAll("#tree .node")].find(
+  (el) => el.getAttribute("data-type") === "note" && el.textContent.includes("未命名笔记"));
+check("待拖拽的笔记在目录树里", !!dragRow);
+
+if (folderRow && dragRow) {
+  hitEl = dragRow;
+  fire(dragRow, "pointerdown", { button: 0, clientX: 10, clientY: 10 });
+  // 只挪 2px：仍在点击阈值内，不应进入拖拽（否则单击就没法选中了）
+  fire(doc, "pointermove", { clientX: 12, clientY: 12 });
+  check("位移未超阈值时不进入拖拽（点击仍可选中）",
+    !doc.body.classList.contains("dragging-active"));
+
+  hitEl = folderRow;
+  fire(doc, "pointermove", { clientX: 60, clientY: 60 });
+  const ghost = doc.querySelector(".drag-ghost");
+  check("超过阈值后进入拖拽态（生成拖拽幽灵 + 抓取光标）",
+    doc.body.classList.contains("dragging-active") && !!ghost,
+    "dragging-active=" + doc.body.classList.contains("dragging-active") + " ghost=" + !!ghost);
+  check("悬停在文件夹上时给出放置高亮", folderRow.classList.contains("drop-target"));
+  const pv = ghost ? window.getComputedStyle(ghost).pointerEvents : "";
+  check("拖拽幽灵不吃指针事件", pv === "none" || pv === "", "pointer-events=" + JSON.stringify(pv));
+
+  fire(doc, "pointerup", { clientX: 60, clientY: 60 });
+  await sleep(900); // 等 debounce 落盘
+  check("拖拽结束后拖拽态清理干净",
+    !doc.body.classList.contains("dragging-active")
+      && !doc.querySelector(".drag-ghost")
+      && !doc.querySelector(".node.drop-target"));
+
+  const movedPath = findPath(STORAGE_DIR, "未命名笔记.md");
+  check("笔记真的被移动到目标文件夹下（拖拽落盘生效）",
+    !!movedPath && path.basename(path.dirname(movedPath)) === FOLDER_NAME,
+    movedPath || "（没找到）");
+}
+
+/* ---------- 11) 导出 / 备份走宿主「另存为」（可自选目录） ---------- */
+const saveCalls = window.__saveCalls;
+check("storage.js 识别到宿主 saveFile 能力", S.hasHostSave() === true);
+check("工具栏有「恢复备份…」按钮", !!$("btn-restore-zip"));
+check("恢复用的 zip 文件选择器存在", !!$("backup-input"));
+
+// 导出：先选中一篇笔记
+const anyNote = [...doc.querySelectorAll("#tree .node")].find((el) => el.getAttribute("data-type") === "note");
+anyNote.click();
+await sleep(50);
+$("btn-export-md").click();
+await sleep(600);
+const exCall = saveCalls.find((c) => c.contentType === "text/markdown");
+check("「导出 .md」弹宿主另存为（带 text/markdown 类型）", !!exCall,
+  saveCalls.map((c) => c.fileName + ":" + c.contentType).join(" | ") || "（没有调用）");
+check("导出的 .md 落在「用户所选目录」",
+  !!exCall && fs.existsSync(exCall.path) && exCall.path.startsWith(SAVED_DIR),
+  exCall ? exCall.path : "（无）");
+
+// 备份
+$("btn-backup-zip").click();
+await sleep(900);
+const bkCall = saveCalls.find((c) => c.contentType === "application/zip");
+check("「备份 zip」弹宿主另存为（带 application/zip 类型）", !!bkCall, bkCall ? bkCall.fileName : "（没有调用）");
+check("备份 zip 落在「用户所选目录」",
+  !!bkCall && fs.existsSync(bkCall.path) && bkCall.path.startsWith(SAVED_DIR),
+  bkCall ? bkCall.path : "（无）");
+if (bkCall && fs.existsSync(bkCall.path)) {
+  const names = zipEntries(fs.readFileSync(bkCall.path));
+  check("备份包含配置 mdnotes-backup.json", names.includes("mdnotes-backup.json"), names.join(", "));
+  check("备份包含目录树索引 .mdnotes/meta.json", names.includes(".mdnotes/meta.json"));
+  check("备份条目名用正斜杠", !names.some((n) => n.includes("\\")));
+  check("备份成功后弹窗说明了「含配置」与如何恢复",
+    $("modal").hidden === false && /含配置|恢复/.test($("modal").textContent),
+    $("modal").textContent.slice(0, 80));
+  [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "关闭").click();
+}
+
+/* ---------- 12) 从备份恢复（完整 UI 流程，含确认框） ---------- */
+if (bkCall && fs.existsSync(bkCall.path)) {
+  const zipBuf = fs.readFileSync(bkCall.path);
+
+  // 先把现场搞坏：改标题 → 磁盘上的文件改名
+  const victim = [...doc.querySelectorAll("#tree .node")].find((el) => el.getAttribute("data-type") === "note");
+  victim.click();
+  await sleep(50);
+  const goodName = $("title").value;
+  $("title").value = "被改坏的名字";
+  fire($("title"), "input");
+  fire($("title"), "blur");
+  await sleep(900);
+  check("现场已破坏（标题改名成功）", !!findPath(STORAGE_DIR, "被改坏的名字.md"),
+    findPath(STORAGE_DIR, "被改坏的名字.md") || "（没改成）");
+
+  // 走 UI：给隐藏的 file input 塞一个真实 File，触发 change
+  const zipFile = new window.File([new Uint8Array(zipBuf)], path.basename(bkCall.path), { type: "application/zip" });
+  const input = $("backup-input");
+  Object.defineProperty(input, "files", { value: [zipFile], configurable: true });
+  fire(input, "change");
+  await waitFor(() => $("modal").hidden === false && $("modal").textContent.includes("确认恢复"), 8000, "恢复确认框");
+  check("选择备份后弹出恢复确认框（含包内信息）",
+    $("modal").hidden === false && $("modal").textContent.includes("确认恢复")
+      && $("modal").textContent.includes("篇笔记"),
+    $("modal").textContent.slice(0, 120) || "（没有弹窗）");
+
+  const startBtn = [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "开始恢复");
+  check("确认框有「开始恢复」按钮", !!startBtn);
+  if (startBtn) {
+    startBtn.click();
+    await waitFor(() => $("modal").hidden === false && $("modal").textContent.includes("恢复完成"), 10000, "恢复完成");
+    check("恢复完成并回报结果",
+      $("modal").textContent.includes("恢复完成"), $("modal").textContent.slice(0, 120));
+    check("恢复后磁盘上原文件名回来了", !!findPath(STORAGE_DIR, goodName + ".md"),
+      goodName + ".md -> " + (findPath(STORAGE_DIR, goodName + ".md") || "（没回来）"));
+    check("恢复后目录树里的标题也复原",
+      [...doc.querySelectorAll("#tree .node")].some((el) => el.textContent.includes(goodName)),
+      "期望含 " + JSON.stringify(goodName)
+        + " · 树=[" + [...doc.querySelectorAll("#tree .node")].map((e) => e.textContent).join(" | ") + "]"
+        + " · 磁盘meta节点=" + (() => {
+          try {
+            const m = JSON.parse(fs.readFileSync(path.join(STORAGE_DIR, ".mdnotes/meta.json"), "utf8"));
+            return m.nodes.map((n) => n.type + ":" + n.name).join(" | ");
+          } catch (e) { return "(读不到 meta: " + e.message + ")"; }
+        })()
+        + " · 磁盘文件=" + (function w(d, pre = "") {
+          return fs.readdirSync(d, { withFileTypes: true }).map((e) =>
+            e.isDirectory() ? w(path.join(d, e.name), pre + e.name + "/") : pre + e.name).join(" | ");
+        })(STORAGE_DIR));
+    check("恢复前留下了退路快照（pre-restore-*.zip）",      fs.readdirSync(STORAGE_DIR).some((f) => f.startsWith("pre-restore-")),
+      fs.readdirSync(STORAGE_DIR).join(", "));
+    [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "关闭").click();
+  }
+}
 
 /* ---------- 汇总 ---------- */
 console.log("\n===== 通过 " + pass.length + " 项 =====");

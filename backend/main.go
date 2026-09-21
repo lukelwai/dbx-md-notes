@@ -15,10 +15,12 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -34,7 +36,7 @@ import (
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
 	pluginID      = "com.example.mdnotes"
-	pluginVersion = "0.5.5" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginVersion = "0.6.0" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -120,8 +122,10 @@ func (plugin *plugin) Handle(
 		return map[string]any{"success": true}, nil
 
 	case "notes/ping":
+		// 版本必须报 resolveMetadata()（运行时读包内 manifest）而不是编译期常量 ——
+		// 常量会在发版时漂移，而 ping 的版本是前端和测试用来判断"跑的是不是新代码"的依据。
 		return map[string]any{
-			"ok": true, "plugin": pluginID, "version": pluginVersion,
+			"ok": true, "plugin": pluginID, "version": resolveMetadata().Version,
 			"storagePath": notesDir(),
 			"configured":  dirConfigured(),
 		}, nil
@@ -177,20 +181,35 @@ func (plugin *plugin) Handle(
 	case "notes/exportNote":
 		var p struct {
 			ID string `json:"id"`
+			// ToDisk=false（默认）：把字节交回前端，由宿主原生「另存为」对话框落盘，
+			// 用户可自选目录。ToDisk=true：老行为，直接写进笔记存储目录（宿主没有
+			// saveFile 能力时的兜底）。
+			ToDisk bool `json:"toDisk"`
 		}
 		if e := json.Unmarshal(params, &p); e != nil {
 			return nil, badParams("invalid params: %v", e)
 		}
-		return exportNote(p.ID)
+		return exportNote(p.ID, p.ToDisk)
 
 	case "notes/backup":
 		var p struct {
-			Scope string `json:"scope"`
+			Scope  string `json:"scope"`
+			ToDisk bool   `json:"toDisk"`
 		}
 		if e := json.Unmarshal(params, &p); e != nil {
 			return nil, badParams("invalid params: %v", e)
 		}
-		return backupNotes(p.Scope)
+		return backupNotes(p.Scope, p.ToDisk)
+
+	case "notes/restore":
+		var p struct {
+			DataBase64 string `json:"dataBase64"`
+			DryRun     bool   `json:"dryRun"`
+		}
+		if e := json.Unmarshal(params, &p); e != nil {
+			return nil, badParams("invalid params: %v", e)
+		}
+		return restoreNotes(p.DataBase64, p.DryRun)
 
 	case "filesystem/list":
 		return callFs(fsList, params)
@@ -543,6 +562,12 @@ func toRel(root, abs string) string {
 // ---------------- 内容哈希缓存（避免重复写盘） ----------------
 
 var hashMu sync.Mutex
+
+// contentHashes 的 key 是【文件的绝对路径】，不是节点 id。
+//
+// 用 id 做 key 会漏掉一个真实场景：用户把「笔记存储目录」改到新目录之后，同一个 id 的笔记在
+// 新目录里根本还不存在，但缓存仍记着「这个 id 的内容没变」→ 保存时整个跳过写盘 → 笔记在新目录
+// 里凭空消失。按路径做 key 才符合「同一个文件、内容没变」这句话的真实语义。
 var contentHashes = map[string]string{}
 
 func contentHash(content string) string {
@@ -550,10 +575,10 @@ func contentHash(content string) string {
 	return fmt.Sprintf("%x", h)
 }
 
-// isUnchanged 返回 true 表示磁盘上的文件内容与 content 一致（无需重写）。
-func isUnchanged(id, abs, hs string) bool {
+// isUnchanged 返回 true 表示 abs 处的文件内容与 content 一致（无需重写）。
+func isUnchanged(abs, hs string) bool {
 	hashMu.Lock()
-	if c, ok := contentHashes[id]; ok && c == hs {
+	if c, ok := contentHashes[abs]; ok && c == hs {
 		hashMu.Unlock()
 		return true
 	}
@@ -561,7 +586,7 @@ func isUnchanged(id, abs, hs string) bool {
 	if data, err := os.ReadFile(abs); err == nil {
 		if contentHash(string(data)) == hs {
 			hashMu.Lock()
-			contentHashes[id] = hs
+			contentHashes[abs] = hs
 			hashMu.Unlock()
 			return true
 		}
@@ -569,12 +594,12 @@ func isUnchanged(id, abs, hs string) bool {
 	return false
 }
 
-func writeContent(id, abs, content string) error {
+func writeContent(abs, content string) error {
 	if err := writeAtomic(abs, []byte(content)); err != nil {
 		return err
 	}
 	hashMu.Lock()
-	contentHashes[id] = contentHash(content)
+	contentHashes[abs] = contentHash(content)
 	hashMu.Unlock()
 	return nil
 }
@@ -684,8 +709,8 @@ func saveNotes(raw json.RawMessage) error {
 			_ = os.Rename(filepath.Join(root, old.File), absTarget)
 		}
 		hs := contentHash(n.Content)
-		if !isUnchanged(n.ID, absTarget, hs) {
-			if err := writeContent(n.ID, absTarget, n.Content); err != nil {
+		if !isUnchanged(absTarget, hs) {
+			if err := writeContent(absTarget, n.Content); err != nil {
 				return err
 			}
 		}
@@ -770,7 +795,12 @@ func notesLoad() (any, *dbxpluginsdk.PluginError) {
 
 // ---------------- 导出 / 备份 ----------------
 
-func exportNote(id string) (any, *dbxpluginsdk.PluginError) {
+// exportNote 导出单篇笔记。
+//
+// toDisk=false（默认）：返回 {name, fileName, dataBase64}，前端交给宿主的原生「另存为」
+// 对话框写盘 —— 这样用户能自己选目录和文件名，而不是被塞进笔记存储目录。
+// toDisk=true：老行为，在笔记存储目录里生成一份 .md 副本来回显路径（兜底用）。
+func exportNote(id string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
 	if id == "" {
 		return nil, badParams("missing id")
 	}
@@ -787,17 +817,29 @@ func exportNote(id string) (any, *dbxpluginsdk.PluginError) {
 	}
 	root := notesDir()
 	src := filepath.Join(root, node.File)
-	dst := absUnique(filepath.Join(root, sanitizeName(node.Name)+".md"))
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return nil, failed(-32004, fmt.Errorf("read note: %w", err))
+	}
+	fileName := sanitizeName(node.Name) + ".md"
+
+	if !toDisk {
+		return map[string]any{
+			"ok":         true,
+			"name":       node.Name,
+			"fileName":   fileName,
+			"dataBase64": base64.StdEncoding.EncodeToString(data),
+			"bytes":      len(data),
+		}, nil
+	}
+
+	dst := absUnique(filepath.Join(root, fileName))
 	if dst != src {
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return nil, failed(-32004, fmt.Errorf("read note: %w", err))
-		}
 		if err := writeAtomic(dst, data); err != nil {
 			return nil, failed(-32004, fmt.Errorf("export note: %w", err))
 		}
 	}
-	return map[string]any{"ok": true, "path": dst, "name": node.Name}, nil
+	return map[string]any{"ok": true, "path": dst, "name": node.Name, "fileName": fileName}, nil
 }
 
 func subtreeIDs(m Meta, rootID string) map[string]bool {
@@ -817,69 +859,373 @@ func subtreeIDs(m Meta, rootID string) map[string]bool {
 	return inc
 }
 
-func backupNotes(scope string) (any, *dbxpluginsdk.PluginError) {
+// ---------------- 备份包格式 ----------------
+//
+// 包内布局与磁盘布局 1:1，所以恢复就是一次朴素复制，不需要任何映射表：
+//
+//	mdnotes-backup.json    备份元信息（版本 / 导出时间 / 当时的存储目录 / 计数）
+//	.mdnotes/meta.json     目录树索引（结构、名称、展开状态）
+//	<真实 .md 相对路径>     正文，与 meta.json 的 file 字段逐字对应
+//
+// 只备份正文而不备份索引，恢复出来就是一堆没有名字和层级的孤儿文件 —— 所以索引必须随包走。
+const backupInfoName = "mdnotes-backup.json"
+const backupMetaEntry = ".mdnotes/meta.json"
+
+// backupInfo 是随备份包一起走的「配置」，供恢复时确认这份包从哪来、能不能用。
+type backupInfo struct {
+	Schema     string `json:"schema"`
+	PluginID   string `json:"pluginId"`
+	Version    string `json:"version"`
+	ExportedAt string `json:"exportedAt"`
+	StorageDir string `json:"storageDir"`
+	Scope      string `json:"scope,omitempty"`
+	Notes      int    `json:"notes"`
+	Folders    int    `json:"folders"`
+	MetaFile   string `json:"metaFile"`
+}
+
+// buildBackupZip 在内存里构造备份包。notes 是要打包的笔记节点，scope 为空表示整库。
+func buildBackupZip(root string, m Meta, notes []MetaNode, folders int, scope string) []byte {
+	var sb strings.Builder
+	zw := zip.NewWriter(&writerCapture{&sb})
+
+	info := backupInfo{
+		Schema:     "dbx-md-notes/backup@1",
+		PluginID:   pluginID,
+		Version:    resolveMetadata().Version,
+		ExportedAt: time.Now().Format(time.RFC3339),
+		StorageDir: root,
+		Scope:      scope,
+		Notes:      len(notes),
+		Folders:    folders,
+		MetaFile:   backupMetaEntry,
+	}
+	if b, e := json.MarshalIndent(info, "", "  "); e == nil {
+		if w, e2 := zw.Create(backupInfoName); e2 == nil {
+			_, _ = w.Write(b)
+		}
+	}
+	if b, e := os.ReadFile(metaPath()); e == nil {
+		if w, e2 := zw.Create(backupMetaEntry); e2 == nil {
+			_, _ = w.Write(b)
+		}
+	}
+	for _, n := range notes {
+		data, err := os.ReadFile(filepath.Join(root, n.File))
+		if err != nil {
+			data = []byte("")
+		}
+		// zip 条目名一律用正斜杠（zip 规范），Windows 的 filepath.Join 会给出反斜杠。
+		w, e := zw.Create(filepath.ToSlash(n.File))
+		if e != nil {
+			continue
+		}
+		_, _ = w.Write(data)
+	}
+	_ = zw.Close()
+	return []byte(sb.String())
+}
+
+func backupFileName(m Meta, scope string) string {
+	if scope != "" {
+		for _, n := range m.Nodes {
+			if n.ID == scope {
+				return sanitizeName(n.Name) + ".zip"
+			}
+		}
+	}
+	now := time.Now()
+	return fmt.Sprintf("md-notes-backup-%04d%02d%02d-%02d%02d.zip",
+		now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute())
+}
+
+// backupNotes 构造备份包。toDisk=false（默认）把字节交回前端，由宿主的原生「另存为」
+// 对话框落盘（用户可自选目录）；toDisk=true 则写进笔记存储目录并回显路径（兜底）。
+func backupNotes(scope string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
 	m := loadMeta()
 	root := notesDir()
 
+	var inc map[string]bool
+	if scope != "" {
+		inc = subtreeIDs(m, scope)
+	}
 	var notes []MetaNode
-	if scope == "" {
-		for _, n := range m.Nodes {
-			if n.Type == "note" {
-				notes = append(notes, n)
-			}
+	folders := 0
+	for _, n := range m.Nodes {
+		if scope != "" && !inc[n.ID] {
+			continue
 		}
-	} else {
-		inc := subtreeIDs(m, scope)
-		for _, n := range m.Nodes {
-			if n.Type == "note" && inc[n.ID] {
-				notes = append(notes, n)
-			}
+		if n.Type == "note" {
+			notes = append(notes, n)
+		} else {
+			folders++
 		}
 	}
-
-	// 构建 zip（内存）
-	var buf []byte
-	func() {
-		var sb strings.Builder
-		zw := zip.NewWriter(&writerCapture{&sb})
-		for _, n := range notes {
-			data, err := os.ReadFile(filepath.Join(root, n.File))
-			if err != nil {
-				data = []byte("")
-			}
-			w, e := zw.Create(n.File)
-			if e != nil {
-				continue
-			}
-			_, _ = w.Write(data)
-		}
-		_ = zw.Close()
-		buf = []byte(sb.String())
-	}()
-	if len(buf) == 0 {
+	if len(notes) == 0 && folders == 0 {
 		return nil, failed(-32005, fmt.Errorf("nothing to backup"))
 	}
 
-	var filename string
-	if scope != "" {
-		var name string
-		for _, n := range m.Nodes {
-			if n.ID == scope {
-				name = n.Name
-				break
+	buf := buildBackupZip(root, m, notes, folders, scope)
+	if len(buf) == 0 {
+		return nil, failed(-32005, fmt.Errorf("nothing to backup"))
+	}
+	filename := backupFileName(m, scope)
+
+	if toDisk {
+		dst := absUnique(filepath.Join(root, filename))
+		if err := writeAtomic(dst, buf); err != nil {
+			return nil, failed(-32005, fmt.Errorf("write backup: %w", err))
+		}
+		return map[string]any{"ok": true, "path": dst, "dir": root, "count": len(notes)}, nil
+	}
+	return map[string]any{
+		"ok":         true,
+		"fileName":   filename,
+		"dataBase64": base64.StdEncoding.EncodeToString(buf),
+		"bytes":      len(buf),
+		"count":      len(notes),
+		"folders":    folders,
+		"storageDir": root,
+		"version":    resolveMetadata().Version,
+	}, nil
+}
+
+// ---------------- 从备份恢复 ----------------
+
+// safeRelPath 把 zip 内的条目名规范化为「相对存储目录的安全路径」。
+// 备份包是可以被替换的输入，必须当不可信数据对待：绝对路径、盘符、`..` 一律拒绝。
+func safeRelPath(name string) (string, bool) {
+	n := strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	if n == "" || strings.HasPrefix(n, "/") {
+		return "", false
+	}
+	if len(n) >= 2 && n[1] == ':' {
+		return "", false // "C:/..." 之类
+	}
+	out := make([]string, 0, 8)
+	for _, p := range strings.Split(n, "/") {
+		switch p {
+		case "", ".":
+			continue
+		case "..":
+			return "", false
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return "", false
+	}
+	return strings.Join(out, "/"), true
+}
+
+// insideRoot 把相对路径解析为绝对路径，并确认它没有跳出 root。
+func insideRoot(root, rel string) (string, bool) {
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	r, err := filepath.Rel(root, abs)
+	if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if filepath.IsAbs(r) {
+		return "", false
+	}
+	return abs, true
+}
+
+// restoreNotes 从备份 zip 恢复笔记与配置。
+//
+// dryRun=true 只解析并回报包里有什么（供 UI 先让用户确认），不落盘。
+//
+// 安全设计：
+//  1. 逐条校验 entry 路径（见 safeRelPath / insideRoot），拒绝跳出存储目录的条目；
+//  2. 限制条目数与解压总量，避免 zip bomb；
+//  3. 必须含 .mdnotes/meta.json，否则不认这个包（避免误喂普通 zip 把库写坏）；
+//  4. 覆盖前自动把当前状态另存一份 pre-restore-*.zip，恢复错了还能退回去；
+//  5. 恢复后清空内容哈希缓存，否则后续保存会因为「缓存说没变」而跳过写盘。
+func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginError) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(dataBase64))
+	if err != nil {
+		return nil, badParams("备份内容不是合法 base64：%v", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		return nil, badParams("这不是一个有效的 zip 备份包：%v", err)
+	}
+
+	const maxEntries = 20000
+	const maxTotal = uint64(256) << 20 // 解压后总量上限 256 MiB
+	const maxFile = uint64(32) << 20   // 单个文件上限 32 MiB
+	if len(zr.File) > maxEntries {
+		return nil, badParams("备份包条目过多（%d）", len(zr.File))
+	}
+
+	root := notesDir()
+	type item struct {
+		zipName string
+		rel     string
+	}
+	var items []item
+	var metaBytes []byte
+	var info backupInfo
+	var total uint64
+
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rel, ok := safeRelPath(f.Name)
+		if !ok {
+			return nil, badParams("备份包含不安全的路径，已拒绝：%s", f.Name)
+		}
+		if _, ok := insideRoot(root, rel); !ok {
+			return nil, badParams("备份包路径越界，已拒绝：%s", f.Name)
+		}
+		total += f.UncompressedSize64
+		if total > maxTotal {
+			return nil, badParams("备份包解压后体积过大，已拒绝")
+		}
+		if f.UncompressedSize64 > maxFile {
+			return nil, badParams("备份包内单个文件过大：%s", f.Name)
+		}
+
+		switch rel {
+		case backupInfoName:
+			if rc, e := f.Open(); e == nil {
+				b, _ := io.ReadAll(io.LimitReader(rc, 1<<20))
+				_ = rc.Close()
+				_ = json.Unmarshal(b, &info)
+			}
+			continue // 元信息只用于回显，不落盘
+		case backupMetaEntry:
+			rc, e := f.Open()
+			if e != nil {
+				return nil, failed(-32006, fmt.Errorf("read backup index: %w", e))
+			}
+			metaBytes, _ = io.ReadAll(io.LimitReader(rc, int64(maxFile)))
+			_ = rc.Close()
+			continue
+		}
+		if !strings.HasSuffix(strings.ToLower(rel), ".md") {
+			continue // 只接受 .md 正文；其余条目忽略，避免把杂七杂八的东西写进库
+		}
+		items = append(items, item{zipName: f.Name, rel: rel})
+	}
+
+	if len(metaBytes) == 0 {
+		return nil, badParams("这不是「MD 笔记」的备份包（缺少 %s）", backupMetaEntry)
+	}
+	var bm Meta
+	if err := json.Unmarshal(metaBytes, &bm); err != nil {
+		return nil, badParams("备份包里的索引已损坏：%v", err)
+	}
+	// 备份可能来自另一个操作系统：索引里的路径分隔符按当前平台归一化，
+	// 否则「Windows 备份 → macOS 恢复」会得到一批文件名里带反斜杠的怪文件。
+	migrated := false
+	for i := range bm.Nodes {
+		if bm.Nodes[i].File == "" {
+			continue
+		}
+		fixed := filepath.FromSlash(strings.ReplaceAll(bm.Nodes[i].File, "\\", "/"))
+		if fixed != bm.Nodes[i].File {
+			bm.Nodes[i].File = fixed
+			migrated = true
+		}
+	}
+	if migrated {
+		if b, e := json.MarshalIndent(bm, "", "  "); e == nil {
+			metaBytes = b
+		}
+	}
+	notes, folders := 0, 0
+	for _, n := range bm.Nodes {
+		if n.Type == "note" {
+			notes++
+		} else {
+			folders++
+		}
+	}
+
+	if dryRun {
+		return map[string]any{
+			"ok": true, "dryRun": true, "info": info,
+			"files": len(items), "notes": notes, "folders": folders,
+			"storageDir": root,
+		}, nil
+	}
+
+	// 覆盖前先把当前状态存一份，恢复错了能退回去。
+	safety := ""
+	if metaExists() {
+		cur := loadMeta()
+		var cnotes []MetaNode
+		cf := 0
+		for _, n := range cur.Nodes {
+			if n.Type == "note" {
+				cnotes = append(cnotes, n)
+			} else {
+				cf++
 			}
 		}
-		filename = sanitizeName(name) + ".zip"
-	} else {
-		now := time.Now()
-		filename = fmt.Sprintf("md-notes-backup-%04d%02d%02d-%02d%02d.zip",
-			now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute())
+		if len(cnotes) > 0 {
+			b := buildBackupZip(root, cur, cnotes, cf, "")
+			p := absUnique(filepath.Join(root, "pre-restore-"+time.Now().Format("20060102-150405")+".zip"))
+			if err := writeAtomic(p, b); err == nil {
+				safety = p
+			}
+		}
 	}
-	dst := absUnique(filepath.Join(root, filename))
-	if err := writeAtomic(dst, buf); err != nil {
-		return nil, failed(-32005, fmt.Errorf("write backup: %w", err))
+
+	byName := map[string]*zip.File{}
+	for _, f := range zr.File {
+		byName[f.Name] = f
 	}
-	return map[string]any{"ok": true, "path": dst, "count": len(notes)}, nil
+
+	written := 0
+	for _, it := range items {
+		f := byName[it.zipName]
+		if f == nil {
+			continue
+		}
+		abs, ok := insideRoot(root, it.rel)
+		if !ok {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return nil, failed(-32006, fmt.Errorf("create dir: %w", err))
+		}
+		rc, e := f.Open()
+		if e != nil {
+			return nil, failed(-32006, fmt.Errorf("open entry %s: %w", it.zipName, e))
+		}
+		data, e := io.ReadAll(io.LimitReader(rc, int64(maxFile)))
+		_ = rc.Close()
+		if e != nil {
+			return nil, failed(-32006, fmt.Errorf("read entry %s: %w", it.zipName, e))
+		}
+		if e := writeAtomic(abs, data); e != nil {
+			return nil, failed(-32006, fmt.Errorf("restore %s: %w", it.rel, e))
+		}
+		written++
+	}
+
+	// 索引最后写：正文全就位了再切换索引，中途失败至少不会出现「索引指向不存在的文件」。
+	if err := os.MkdirAll(metaDir(), 0o755); err != nil {
+		return nil, failed(-32006, fmt.Errorf("create meta dir: %w", err))
+	}
+	if err := writeAtomic(metaPath(), metaBytes); err != nil {
+		return nil, failed(-32006, fmt.Errorf("restore index: %w", err))
+	}
+
+	// 磁盘上的正文刚被外部改写，哈希缓存必须作废，否则后续保存会跳过写盘。
+	hashMu.Lock()
+	contentHashes = map[string]string{}
+	hashMu.Unlock()
+
+	sidecarTrace(fmt.Sprintf("notes/restore ok dir=%s files=%d notes=%d safety=%s",
+		root, written, notes, safety))
+	return map[string]any{
+		"ok": true, "files": written, "notes": notes, "folders": folders,
+		"storageDir": root, "safetyPath": safety, "backup": info,
+	}, nil
 }
 
 // writerCapture 把 zip 写入内存（strings.Builder 仅作字节容器）。
