@@ -7,7 +7,8 @@ import crypto from "node:crypto";
 import zlib from "node:zlib";
 
 const ROOT = "D:/core/web/dbx-pj/dbx-md-notes";
-const srcVer = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8")).version;
+const srcMani = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
+const srcVer = srcMani.version;
 const f = process.argv[2] || (() => {
   const dir = path.join(ROOT, "dist");
   const cands = fs.readdirSync(dir).filter((n) => n.endsWith(".dbxp"))
@@ -69,6 +70,8 @@ for (const e of es) {
 
 const checks = [
   ["manifest.version 与源码一致", mani.version === srcVer, mani.version + " vs " + srcVer],
+  ["manifest.id 与源码一致（防「验的是旧 id 的包」）", mani.id === srcMani.id, mani.id + " vs " + srcMani.id],
+  ["manifest.publisher 与源码一致", mani.publisher === srcMani.publisher, mani.publisher + " vs " + srcMani.publisher],
   ["executable 指向 bin/windows-x64/*.exe", /^bin\/windows-x64\/dbx-plugin-mdnotes\.exe$/.test(exeRel), exeRel],
   ["executable 在包内真实存在", has(exeRel)],
   ["checksums.algorithm = sha256", cks.algorithm === "sha256", cks.algorithm],

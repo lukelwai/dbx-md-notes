@@ -1,11 +1,11 @@
 {
   "$schema": "https://raw.githubusercontent.com/t8y2/dbx/main/plugins/manifest.schema.json",
   "manifest_version": 1,
-  "id": "com.example.mdnotes",
+  "id": "com.lwai.mdnotes",
   "name": "MD 笔记",
-  "version": "0.6.2",
-  "publisher": "example",
-  "description": "Markdown 笔记连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记由 Sidecar 落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
+  "version": "0.7.0",
+  "publisher": "lwai",
+  "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
   "icon": "assets/plugin.svg",
   "engines": {
     "dbx": ">=0.5.68",
@@ -26,19 +26,19 @@
   "contributions": [
     {
       "type": "workbench",
-      "id": "com.example.mdnotes.main",
+      "id": "com.lwai.mdnotes.main",
       "label": "MD 笔记",
       "description": "Markdown 笔记工作台",
       "icon": "assets/plugin.svg"
     },
     {
       "type": "connection-provider",
-      "id": "com.example.mdnotes.conn",
+      "id": "com.lwai.mdnotes.conn",
       "label": "MD 笔记",
       "description": "创建一个 MD 笔记连接，用于打开独立的 Markdown 笔记工作台。",
       "icon": "assets/plugin.svg",
       "database_type": "mdnotes",
-      "workbench": "com.example.mdnotes.main",
+      "workbench": "com.lwai.mdnotes.main",
       "capabilities": [
         "test",
         "connect",
@@ -71,7 +71,7 @@
     },
     {
       "type": "filesystem-provider",
-      "id": "com.example.mdnotes.fs",
+      "id": "com.lwai.mdnotes.fs",
       "label": "MD 笔记",
       "description": "把笔记以 .md 文件形式暴露给 DBX 通用文件管理器（mdnotes://）。",
       "icon": "assets/plugin.svg",
@@ -93,11 +93,11 @@
       "name": "MD Notes",
       "description": "Markdown notes connection type: create an MD Notes connection to open the notebook workbench. Notes are persisted by the sidecar into the storage directory and exposed as an mdnotes:// virtual filesystem.",
       "contributions": {
-        "com.example.mdnotes.main": {
+        "com.lwai.mdnotes.main": {
           "label": "MD Notes",
           "description": "Markdown notes workbench"
         },
-        "com.example.mdnotes.conn": {
+        "com.lwai.mdnotes.conn": {
           "label": "MD Notes",
           "description": "Create an MD Notes connection to open a standalone Markdown notebook workbench.",
           "fields": {
@@ -112,7 +112,7 @@
             }
           }
         },
-        "com.example.mdnotes.fs": {
+        "com.lwai.mdnotes.fs": {
           "label": "MD Notes",
           "description": "Expose notes as .md files in the DBX file manager (mdnotes://)."
         }

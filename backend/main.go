@@ -31,13 +31,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	dbxpluginsdk "github.com/example/mdnotes/dbxsdk"
+	dbxpluginsdk "github.com/lwai/mdnotes/dbxsdk"
 )
 
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
-	pluginID      = "com.example.mdnotes"
-	pluginVersion = "0.6.2" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginID      = "com.lwai.mdnotes"
+	pluginVersion = "0.7.0" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -238,7 +238,7 @@ func (plugin *plugin) Handle(
 	case "filesystem/rename":
 		return callFs(fsRename, params)
 
-	case "contextMenu/com.example.mdnotes.newNoteForTable":
+	case "contextMenu/com.lwai.mdnotes.newNoteForTable":
 		return handleNewNoteForTable(params)
 
 	default:

@@ -45,7 +45,7 @@
 
   var MD = window.MDNotes = window.MDNotes || {};
 
-  var DATA_KEY = "com.example.mdnotes:data:v2";
+  var DATA_KEY = "com.lwai.mdnotes:data:v2";
   var RPC_TIMEOUT = 30000;
   var READY_TIMEOUT = 8000;   // 等宿主 init 消息
   var CTX_TIMEOUT = 2500;     // host.getContext 兜底
@@ -56,7 +56,7 @@
 
   /* ============ 诊断日志（页面置顶诊断条 + 状态弹窗共用，实时刷新） ============ */
 
-  var UI_VERSION = "0.6.2";   // 打包脚本会校验它与 manifest.version 一致
+  var UI_VERSION = "0.7.0";   // 打包脚本会校验它与 manifest.version 一致
   var T0 = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
   /** 自模块加载起的毫秒数（给每条日志打上相对时间，能看出卡在哪一步） */
   function since() {

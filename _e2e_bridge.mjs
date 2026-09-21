@@ -149,7 +149,7 @@ context.parent = {
     if (msg.type === "ready") {
       setTimeout(() => emitToPlugin({
         source: "dbx-host", version: 1, type: "init",
-        pluginId: manifest.id, contributionId: "com.example.mdnotes.main",
+        pluginId: manifest.id, contributionId: "com.lwai.mdnotes.main",
         locale: "zh-CN", permissions: manifest.permissions, capabilities: {}, context: workbenchContext,
       }), 0);
       return;

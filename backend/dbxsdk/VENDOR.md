@@ -20,7 +20,7 @@ risks silently drifting from the host's protocol expectations. Upstream README i
 3. Vendored as a plain package inside this module, the sidecar needs only Go 1.20+ and builds
    **fully offline** — which is also how `dbx-plugin-files` handles its Rust SDK.
 
-Import path inside this plugin: `github.com/example/mdnotes/dbxsdk`.
+Import path inside this plugin: `github.com/lwai/mdnotes/dbxsdk`.
 
 ## Transport
 

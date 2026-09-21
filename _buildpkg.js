@@ -64,8 +64,7 @@ if (missingCritical.length) {
   process.exit(1);
 }
 
-// (b2) 同名函数声明：后声明的会静默覆盖前面的，函数名撞车不会有任何提示。
-//      2026-09-21 事故：confirmModal 定义两次（一个收字符串、一个收数组），
+// (b2) 同名函数声明：后声明的会静默覆盖前面的，函数名撞车不会有任何提示。//      2026-09-21 事故：confirmModal 定义两次（一个收字符串、一个收数组），
 //      后者顶掉前者 → removeNode 传字符串进去 `lines.join is not a function` 抛错，
 //      表现成「点删除毫无反应」。
 const fnLines = {};
@@ -123,6 +122,12 @@ if (uiVer !== ver) {
   process.exit(1);
 }
 console.log("  自检通过：DOM 引用 0 处悬空 / 关键元素齐备 / UI_VERSION=" + uiVer);
+
+// (e) 发布前提醒：别再拿占位身份发出去（发布包用 example 占位会与别人的插件撞 id）
+if (!mani.publisher || mani.publisher === "example" || /^com\.example\./.test(mani.id)) {
+  console.warn("\n[WARN] manifest 的 id / publisher 仍是占位值（" + mani.id + " / " + mani.publisher +
+    "）：正式发布前请改成自己的。\n");
+}
 
 // ---- 2) 收集包内文件（跳过 _ 前缀临时文件与隐藏文件）----
 const files = [

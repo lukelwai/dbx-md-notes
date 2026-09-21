@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	dbxpluginsdk "github.com/example/mdnotes/dbxsdk"
+	dbxpluginsdk "github.com/lwai/mdnotes/dbxsdk"
 )
 
 func call(t *testing.T, method string, params any) any {
