@@ -89,10 +89,41 @@ node _buildpkg.js
 ```
 
 `_buildpkg.js` 会：把 `manifest.entrypoints.backend.executable` 重写为包内真实路径
-（`bin/windows-x64/dbx-plugin-mdnotes.exe`）、生成**精确覆盖每个文件**的 `checksums.json`、跳过 `_` 前缀文件。
+（`bin/<target>/dbx-plugin-mdnotes[.exe]`，**只有 windows 目标带 `.exe`**）、生成**精确覆盖每个文件**的 `checksums.json`、
+跳过 `_` 前缀文件，并给包内条目写上 **Unix 权限位**。
+
+> **为什么必须写权限位**：宿主安装器在 macOS/Linux 上会按 zip 条目的 unix mode 调 `set_permissions`；
+> 而 zip 读取库在 `external_attributes == 0`（或「制作系统」不是 Unix）时**返回 None**，宿主就会跳过设权限 ——
+> 解出来的侧车是 `0644`、**没有可执行位，根本起不来**。官方打包器给 `bin/<target>/` 下的文件 `0755`、其余 `0644`，
+> 本仓库的打包脚本照做，`_verify.mjs` 也加了对应断言。
 
 > 也可以走官方 CLI（`npm install -g @dbx-app/plugin-cli` 后 `dbx-plugin dev` / `dbx-plugin package`），
 > 其行为等价。注意 `dbx-plugin.toml` 的 `[package].include` **不要**包含 `bin/` —— 二进制由打包器注入。
+
+### 一次产出全部平台（含 `release-candidates.json`）
+
+官方 CLI **只按当前宿主平台打包**，显式指定别的 `--target` 会被拒绝
+（`Native plugin target 'X' does not match build host 'Y'; run this package command on the target platform`）；
+官方文档给的多平台做法是在 CI 上开平台矩阵、各自构建，再合并出 `release-candidates.json`。
+
+本插件的侧车是**纯 Go、无 cgo**，可以直接交叉编译，因此本地一条命令就能出全套：
+
+```bash
+node _release.mjs                       # 默认 windows-x64 + darwin-arm64 + linux-x64
+node _release.mjs windows-x64 linux-x64 # 也可以只做指定平台
+```
+
+它依次做四件事：交叉编译侧车（`CGO_ENABLED=0 GOOS/GOARCH=...`，产物落在 `_xbuild/`）→ 逐平台打包
+→ 逐包校验（`_verify.mjs`）→ 汇总出：
+
+```
+dist/<id>-<version>-<target>.dbxp            未签名候选包（上传到 Release / CDN / 对象存储）
+dist/<id>-<version>-<target>.artifact.json   该包的 target / url / sha256 / size
+dist/release-candidates.json                 plugin 元信息 + 全部平台 artifacts（dbx-store 同步用）
+```
+
+> **`release-candidates.json` 里的 `sha256` 绑定确切字节**：改完代码重新构建后必须重新生成它，
+> 并上传**同一批** `.dbxp`。官方发布后的资产不允许覆盖，任何字节变化都要递增版本号重新走审核。
 
 > **不要手动设置 `GOROOT` 指向错目录**。Go 1.21+ 会自行定位；若升级 Go 后旧目录还在、环境变量没跟着改，
 > 会出现 `package encoding/json is not in std` 这类全线报错 —— 见[排障](#排障)。
@@ -118,8 +149,9 @@ dbx-md-notes/
 │   ├── main.go            # 侧车：笔记文件读写、索引、导出/备份/恢复、mdnotes:// 文件系统
 │   ├── main_test.go       # 单测：重命名/移动、备份恢复往返、路径穿越拒绝、数据安全回归
 │   └── dbxsdk/            # 官方 Go SDK 原样 vendor（见 dbxsdk/VENDOR.md）
-├── dist/                  # 打包产物 *.dbxp（不进版本控制）
-└── _*.{js,mjs,py}         # 验证工具链（`_` 前缀，不进包）
+├── dist/                  # 打包产物 *.dbxp / *.artifact.json / release-candidates.json（不进版本控制）
+├── _xbuild/               # 交叉编译出的 darwin/linux 侧车（不进版本控制）
+└── _*.{js,mjs,py}         # 验证与发布工具链（`_` 前缀，不进包）
 ```
 
 ### 为什么 vendor 官方 SDK
@@ -143,8 +175,10 @@ NODE=<node 可执行文件>
 "$NODE" _e2e_bridge.mjs   # 1) 桥接级：官方 SDK 源串在 vm 里跑 + 模拟宿主 dispatch + 真实 storage.js + 真实侧车
 "$NODE" _e2e_ui.mjs       # 2) UI 级：真实 index.html 灌进 jsdom + 真实侧车（需 jsdom）
 $PYTHON _domcheck.py      # 3) 静态：DOM 引用悬空、重复函数声明、关键元素缺失
-"$NODE" _buildpkg.js && "$NODE" _verify.mjs   # 4) 打包（内建自检）+ 产物结构 / sha256 校验
+"$NODE" _buildpkg.js && "$NODE" _verify.mjs   # 4) 打包（内建自检）+ 产物结构 / sha256 / 权限位校验
 ```
+
+要一次出全平台候选包与 `release-candidates.json`，直接跑 `_release.mjs`（它内部会调用上面第 4 步）。
 
 各层能抓住什么：
 

@@ -36,6 +36,8 @@ function entries(b) {
       csize: b.readUInt32LE(p + 20),
       usize: b.readUInt32LE(p + 24),
       lho: b.readUInt32LE(p + 42),
+      madeBy: b.readUInt16LE(p + 4),        // 高字节 = 制作系统（3 = Unix）
+      ext: b.readUInt32LE(p + 38),          // 外部属性：高 16 位 = Unix 权限
     });
     p += 46 + nameLen + extraLen + commentLen;
   }
@@ -68,16 +70,37 @@ for (const e of es) {
   if (cks.files[e.name] !== h) mismatch.push(e.name);
 }
 
+// 从文件名解析 target（<id>-<version>-<target>.dbxp），据此校验 executable 的路径与扩展名。
+// 只有 windows 目标带 .exe —— 对齐官方 CLI 的 executable_name()。
+const baseName = path.basename(f);
+const pkgPrefix = srcMani.id + "-" + srcMani.version + "-";
+const pkgTarget = baseName.startsWith(pkgPrefix) && baseName.endsWith(".dbxp")
+  ? baseName.slice(pkgPrefix.length, -".dbxp".length) : "";
+const exeSuffix = pkgTarget.startsWith("windows") ? ".exe" : "";
+const exeExpected = pkgTarget ? `bin/${pkgTarget}/dbx-plugin-mdnotes${exeSuffix}` : "";
+
 const checks = [
   ["manifest.version 与源码一致", mani.version === srcVer, mani.version + " vs " + srcVer],
   ["manifest.id 与源码一致（防「验的是旧 id 的包」）", mani.id === srcMani.id, mani.id + " vs " + srcMani.id],
   ["manifest.publisher 与源码一致", mani.publisher === srcMani.publisher, mani.publisher + " vs " + srcMani.publisher],
-  ["executable 指向 bin/windows-x64/*.exe", /^bin\/windows-x64\/dbx-plugin-mdnotes\.exe$/.test(exeRel), exeRel],
+  ["文件名里的 target 合法", /^[a-z0-9-]{1,64}$/.test(pkgTarget), pkgTarget || "(解析不出 target)"],
+  ["executable 指向 bin/<target>/<binary>[.exe]（windows 才带 .exe）",
+    exeRel === exeExpected, exeRel + (exeExpected ? " vs " + exeExpected : "")],
   ["executable 在包内真实存在", has(exeRel)],
   ["checksums.algorithm = sha256", cks.algorithm === "sha256", cks.algorithm],
   ["checksums 精确覆盖包内文件", JSON.stringify(inPkg) === JSON.stringify(listed), "包内" + inPkg.length + " / 清单" + listed.length],
   ["全部 sha256 匹配", mismatch.length === 0, mismatch.join(",")],
   ["无 _ 前缀临时文件混入", !es.some((e) => /(^|\/)_/.test(e.name))],
+  // Unix 权限位：宿主的 installer.rs 只在 entry.unix_mode() 有值时才 set_permissions，
+  // 而 zip crate 在 external_attributes==0（或制作系统不是 Unix）时返回 None
+  // → 解出来的文件是默认 0644 → **侧车没有可执行位，macOS/Linux 上起不来**。
+  ["制作系统声明为 Unix（否则权限位被忽略）", es.every((e) => (e.madeBy >> 8) === 3),
+    es.map((e) => e.madeBy >> 8).join(",")],
+  ["可执行文件带 0755 权限位", (() => {
+    const e = es.find((x) => x.name === exeRel);
+    return !!e && ((e.ext >> 16) & 0o777) === 0o755;
+  })(), (() => { const e = es.find((x) => x.name === exeRel); return e ? "0" + ((e.ext >> 16) & 0o777).toString(8) : "(无)"; })()],
+  ["普通文件带 0644 权限位", es.filter((e) => e.name !== exeRel).every((e) => ((e.ext >> 16) & 0o777) === 0o644)],
 ];
 const st = get("ui/storage.js").toString("utf8");
 const exeStr = (get(exeRel) || Buffer.alloc(0)).toString("latin1");

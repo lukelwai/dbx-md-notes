@@ -4,7 +4,8 @@
 // （宿主源码 crates/dbx-plugin-runtime/src/plugins/installer.rs 与 manifest.rs）：
 //
 //   1) manifest.entrypoints.backend.executable 必须指向包内【真实存在】的文件。
-//      官方打包器会把它重写成 bin/<target>/<binary>.exe（target 形如 windows-x64）。
+//      官方打包器会把它重写成 bin/<target>/<binary>[.exe]（target 形如 windows-x64，
+//      **只有 windows 目标才带 .exe** —— 官方 CLI 的 executable_name() 就是这么定的）。
 //      宿主解析时不会自动补 ".exe"，也不会做 target 目录替换 —— 名字对不上就是
 //      "Plugin backend executable does not exist" → 整个包判为 incompatible。
 //   2) 必须包含 checksums.json（algorithm 必须是 "sha256"），且 files 必须
@@ -13,19 +14,69 @@
 //   3) signature.json 可省，但只能在插件中心开启「允许安装未签名开发包」后安装。
 //
 // 这三条里 1 和 2 任何一条不满足，安装会直接失败，表现为「装完之后什么也存不了」。
+//
+// 用法：
+//   node _buildpkg.js                            # 默认 windows-x64（用 backend/ 下的本机构建产物）
+//   node _buildpkg.js --target linux-x64         # 用 _xbuild/ 下的交叉编译产物
+//   node _buildpkg.js --target darwin-arm64 --exe <path>
+//
+// 关于多平台：官方 CLI（dbx-plugin package）**拒绝**为「非当前宿主」的 target 打包
+// （"Native plugin target 'X' does not match build host 'Y'; run this package command on the target platform"），
+// 官方推荐的做法是在 CI 上按平台矩阵分别构建。但本插件的侧车是**纯 Go、无 cgo**，
+// 可以直接交叉编译（见 _release.mjs），因此本地也能产出其它平台的合法包。
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
 
 const root = "D:/core/web/dbx-pj/dbx-md-notes/";
-const target = "windows-x64";              // current_plugin_target(): {os}-{arch}
 const binary = "dbx-plugin-mdnotes";       // 与 dbx-plugin.toml [backend].binary 一致
+
+const argv = process.argv.slice(2);
+function argValue(name) {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : "";
+}
+const target = argValue("--target") || "windows-x64";   // current_target(): {os}-{arch}
+if (!/^[a-z0-9-]{1,64}$/.test(target)) {
+  console.error(`\n[FATAL] target 含非法字符：${target}（只允许小写字母/数字/-，与官方 validate_artifact_target 一致）\n`);
+  process.exit(1);
+}
+
+// 目标 → Go 的 GOOS/GOARCH。windows-x64 用 backend/ 下本机构建的那份，其余用交叉编译产物。
+const GO_TRIPLES = {
+  "windows-x64": ["windows", "amd64"],
+  "windows-arm64": ["windows", "arm64"],
+  "darwin-arm64": ["darwin", "arm64"],
+  "darwin-x64": ["darwin", "amd64"],
+  "linux-x64": ["linux", "amd64"],
+  "linux-arm64": ["linux", "arm64"],
+};
+function resolveExe() {
+  const explicit = argValue("--exe");
+  if (explicit) { return explicit; }
+  if (target === "windows-x64") { return root + `backend/${binary}.exe`; }
+  const t = GO_TRIPLES[target];
+  if (!t) {
+    console.error(`\n[FATAL] 未知 target：${target}。已知：${Object.keys(GO_TRIPLES).join(", ")}\n`);
+    process.exit(1);
+  }
+  return root + `_xbuild/${binary}-${t[0]}-${t[1]}`;
+}
 
 const mani = JSON.parse(fs.readFileSync(root + "manifest.json", "utf8"));
 const ver = mani.version || "0.0.0";
-const exeRel = `bin/${target}/${binary}.exe`;
+// 只有 windows 目标带 .exe（对齐官方 executable_name()）
+const exeRel = `bin/${target}/${binary}${target.startsWith("windows") ? ".exe" : ""}`;
+const exePath = resolveExe();
 const out = root + `dist/${mani.id}-${ver}-${target}.dbxp`;
+
+if (!fs.existsSync(exePath)) {
+  console.error(`\n[FATAL] 找不到 target=${target} 的侧车二进制：${exePath}`);
+  console.error(`        先构建：CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -C backend -o ../_xbuild/${binary}-<os>-<arch> .`);
+  console.error(`        （或直接跑 node _release.mjs 一次产出全部平台）\n`);
+  process.exit(1);
+}
 
 // ---- 1) 重写 manifest，使 executable 与包内真实路径一致 ----
 mani.entrypoints = mani.entrypoints || {};
@@ -132,7 +183,7 @@ if (!mani.publisher || mani.publisher === "example" || /^com\.example\./.test(ma
 // ---- 2) 收集包内文件（跳过 _ 前缀临时文件与隐藏文件）----
 const files = [
   ["manifest.json", manifestBytes],
-  [exeRel, fs.readFileSync(root + "backend/" + binary + ".exe")],
+  [exeRel, fs.readFileSync(exePath)],
 ];
 for (const dir of ["assets", "ui"]) {
   (function walk(d, rel) {
@@ -183,16 +234,26 @@ for (const [name, data] of files) {
   lh.writeUInt16LE(0, 28);
   local.push(lh, nameBuf, comp);
 
+  // ---- Unix 权限位（macOS/Linux 上必须写对，否则侧车起不来）----
+  // 宿主安装器（installer.rs）在 Unix 上会执行：
+  //     if let Some(mode) = entry.unix_mode() { set_permissions(from_mode(mode & 0o777)) }
+  // 而 zip crate 的 unix_mode() 在 `external_attributes == 0` 时直接返回 None
+  //   → 宿主跳过设权限 → 解出来的文件是默认 0o644 → **侧车没有可执行位，无法启动**。
+  // 官方打包器给 bin/<target>/ 下的文件 0o755、其余 0o644；这里照做。
+  // 模式位存在 external_attributes 的高 16 位，且要高字节声明 System::Unix（3）才会被读取。
+  const isExe = name === exeRel;
+  const unixMode = isExe ? 0o100755 : 0o100644;   // S_IFREG | 权限（与 zip crate 的写法一致）
   const ch = Buffer.alloc(46);
   ch.writeUInt32LE(0x02014b50, 0);
-  ch.writeUInt16LE(20, 4);
+  ch.writeUInt16LE((3 << 8) | 20, 4);  // version made by：高字节 3 = Unix
   ch.writeUInt16LE(20, 6);
   ch.writeUInt16LE(8, 10);
   ch.writeUInt32LE(crc, 16);
   ch.writeUInt32LE(comp.length, 20);
   ch.writeUInt32LE(data.length, 24);
   ch.writeUInt16LE(nameBuf.length, 28);
-  ch.writeUInt32LE(0, 38);
+  // 注意：JS 的 `<<` 是 32 位【有符号】运算，0o100644<<16 会溢出成负数 —— 必须用乘法。
+  ch.writeUInt32LE((unixMode * 0x10000) >>> 0, 38);
   ch.writeUInt32LE(off, 42);
   central.push(Buffer.concat([ch, nameBuf]));
 }
@@ -219,5 +280,5 @@ fs.writeFileSync(out.replace(/\.dbxp$/, ".artifact.json"), JSON.stringify({
 }, null, 2) + "\n");
 
 console.log("built " + out);
-console.log("  size=" + pkg.length + "  entries=" + files.length);
+console.log("  target=" + target + "  size=" + pkg.length + "  entries=" + files.length);
 console.log("  executable=" + exeRel + "  version=" + ver);

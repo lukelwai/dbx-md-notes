@@ -19,3 +19,5 @@ frontend/.pnpm-store/
 .zcode/
 _e2e_tmp
 _e2e_ui_tmp
+# 交叉编译产物（_release.mjs 生成）：darwin/linux 侧车二进制，供 _buildpkg.js --target 使用
+/_xbuild/
