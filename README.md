@@ -35,11 +35,6 @@
 4. 填写 **笔记存储目录**（有读写权限的绝对路径，可点右侧文件夹按钮选择）→ 测试连接；
 5. 打开连接即进入工作台。状态栏（右下角）应显示「已保存到存储目录：…」，点它可看存储状态详情。
 
-> **id 变更提示**：`0.7.0` 起插件 id 从 `com.example.mdnotes` 改为 **`com.lwai.mdnotes`**。
-> 对宿主来说这是**另一个插件**，因此需要重新安装一次；旧 id 的安装与数据目录（`plugin-data/com.example.mdnotes/`）
-> 不会自动迁移。**笔记本身不受影响** —— 它们始终是存储目录里的普通 `.md` 文件，
-> 新连接指向同一个目录即可照常打开。
-
 ---
 
 ## 数据安全
@@ -90,7 +85,7 @@ GOROOT=<go 根> <go> build -C backend -o dbx-plugin-mdnotes.exe .
 
 # 2) 打包（会先跑静态自检，再生成 .dbxp 与同名 artifact.json）
 node _buildpkg.js
-# → dist/com.lwai.mdnotes-0.7.0-windows-x64.dbxp
+# → dist/com.lwai.mdnotes-0.7.1-windows-x64.dbxp
 ```
 
 `_buildpkg.js` 会：把 `manifest.entrypoints.backend.executable` 重写为包内真实路径

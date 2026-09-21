@@ -1,0 +1,11 @@
+{
+  "name": "MD 笔记",
+  "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
+  "icon": "assets/plugin.svg",
+  "tags": ["md", "notes", "files", "storage"],
+  "permissions": ["host.filesystem"],
+  "source": "https://github.com/lukelwai/dbx-md-notes",
+  "homepage": "https://github.com/lukelwai/dbx-md-notes",
+  "license": "Apache-2.0",
+  "releaseNotes": "Initial release."
+}

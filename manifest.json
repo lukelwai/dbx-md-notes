@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "com.lwai.mdnotes",
   "name": "MD 笔记",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "publisher": "lwai",
   "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
   "icon": "assets/plugin.svg",
