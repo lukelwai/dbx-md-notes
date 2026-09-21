@@ -638,14 +638,15 @@
              : "已持久化保存" + (st.storageDir ? "（" + st.storageDir + "）" : ""));
   }
 
-  /* ============ 页面置顶诊断条（不用点开，一直在最上方） ============
-   * 设计目标：用户不必点任何东西就能看到「笔记到底会不会落盘、卡在哪一步」。
-   *  - 一行判断（verdict）：直接说人话
-   *  - 一行摘要：后端 / 可持久化 / 桥接 / 侧车 / 目录 / 错误
-   *  - 逐步日志：带 +N.NNNs 相对时间戳，能看出卡在哪一步
-   *  - 出问题自动展开；一切正常自动收起（但摘要始终可见）
+  /* ============ 页面置顶诊断条（上线默认关闭，保留代码便于排障） ============
+   * 2026-09-21：存储已稳定，按产品要求把置顶条下线（线上太占地方）。
+   * 需要排障时：把 SHOW_DIAG_BAR 改成 true + 取消 index.html 里那段注释即可，
+   * renderDiag() 的调用点全部保留着，无需再改其它地方。
    */
-  var diagOpen = true;    // 默认展开：日志直接显示在首页置顶，不用点
+  var SHOW_DIAG_BAR = false;
+  var SHOW_DIAG_LOG_IN_MODAL = false;   // 存储状态弹窗里的「存储诊断日志」面板，默认隐藏
+
+  var diagOpen = true;
   var diagLastSev = null;
 
   function diagSeverity(st) {
@@ -678,6 +679,7 @@
   }
 
   function renderDiag() {
+    if (!SHOW_DIAG_BAR) { return; }   // 置顶诊断条已下线
     var bar = $("diag-bar");
     if (!bar) { return; }
     var st = S.status();   // 同上：必须现取副本，否则 st.diag 为空 → 日志区永远显示"（暂无日志）"
@@ -740,18 +742,21 @@
       p.textContent = lines.join("\n");
       card.appendChild(p);
 
-      // 诊断日志：逐步记录桥接/上下文/侧车握手的结果，出问题时可直接看出卡在哪一步。
-      var det = document.createElement("details");
-      det.className = "m-diag";
-      det.open = !st.persistent;   // 有问题默认展开
-      var sum = document.createElement("summary");
-      sum.textContent = "存储诊断日志（" + ((st.diag && st.diag.length) || 0) + " 条，排查用）";
-      det.appendChild(sum);
-      var pre = document.createElement("pre");
-      pre.className = "m-pre";
-      pre.textContent = (st.diag && st.diag.length) ? st.diag.join("\n") : "（无）";
-      det.appendChild(pre);
-      card.appendChild(det);
+      // 诊断日志面板：上线默认隐藏（SHOW_DIAG_LOG_IN_MODAL=false），
+      // 改成 true 即可放出来；日志本身始终保留在 S.status().diag / S.report() 里。
+      if (SHOW_DIAG_LOG_IN_MODAL) {
+        var det = document.createElement("details");
+        det.className = "m-diag";
+        det.open = !st.persistent;   // 有问题默认展开
+        var sum = document.createElement("summary");
+        sum.textContent = "存储诊断日志（" + ((st.diag && st.diag.length) || 0) + " 条，排查用）";
+        det.appendChild(sum);
+        var pre = document.createElement("pre");
+        pre.className = "m-pre";
+        pre.textContent = (st.diag && st.diag.length) ? st.diag.join("\n") : "（无）";
+        det.appendChild(pre);
+        card.appendChild(det);
+      }
 
       var acts = [];
       if (st.fsSupported) {
@@ -1338,12 +1343,13 @@
       showCtxMenu(e.clientX, e.clientY, null);
     });
 
-    // 置顶诊断条上的三个按钮
-    click("diag-toggle", function () { diagOpen = !diagOpen; renderDiag(); });
-    click("diag-copy", function () { copyText(S.report(), "诊断报告"); });
-    click("diag-detail", openStoreModal);
+    // 置顶诊断条上的按钮：随 SHOW_DIAG_BAR 一起下线（元素已注释，绑定会打日志噪音）。
+    // 需要排障时连同上面的开关一起放开：
+    // click("diag-toggle", function () { diagOpen = !diagOpen; renderDiag(); });
+    // click("diag-copy", function () { copyText(S.report(), "诊断报告"); });
+    // click("diag-detail", openStoreModal);
 
-    // 状态栏胶囊 → 同一份状态详情弹窗。即使它点不开，置顶诊断条也一直在页面上。
+    // 状态栏胶囊 → 状态详情弹窗
     click("store-status", openStoreModal);
 
     document.addEventListener("keydown", function (e) {
@@ -1414,7 +1420,7 @@
       phase = "首次渲染";
       renderStatus(S.status());
       renderDiag(S.status());
-      S.log("前端 UI 就绪", true, "按钮绑定与置顶诊断条完成，接下来调用存储 init()");
+      S.log("前端 UI 就绪", true, "按钮绑定完成（置顶诊断条已下线），接下来调用存储 init()");
     } catch (e) {
       // 关键：任何前置阶段出错也要把诊断条画出来，否则用户只会看到一个死界面
       S.log("前端启动中断", false, phase + " 阶段抛错：" + ((e && e.message) || String(e)));

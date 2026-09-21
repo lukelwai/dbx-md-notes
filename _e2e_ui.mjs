@@ -12,7 +12,8 @@
  * 注入一个与宿主 bridge 语义一致的假 dbxPlugin（ready / context / invoke / request /
  * onContext），invoke 走真实 Go 侧车的 JSON-RPC。断言聚焦在：
  *   - boot 是否走完、按钮是否真的可点（不是「绑定被静默跳过」）
- *   - 置顶诊断条是否给出正确结论、日志里有没有 [FAIL]
+ *   - 存储后端是否真握手成功、日志里有没有 [FAIL]（日志取自 S.status().diag）
+ *   - 置顶诊断条确实已下线（上线形态）
  *   - 笔记是否真的以 .md 落到磁盘
  *
  * 用法: node _e2e_ui.mjs
@@ -153,7 +154,13 @@ const fail = [];
 function check(name, cond, extra) {
   (cond ? pass : fail).push(name + (extra ? "  |  " + extra : ""));
 }
-const diagText = () => ($("diag-log") ? $("diag-log").textContent : "");
+// 置顶诊断条已下线（SHOW_DIAG_BAR=false），日志只存在于存储层：S.status().diag
+const diagText = () => {
+  const s = window.MDNotes && window.MDNotes.storage;
+  if (!s) return "";
+  const st = s.status();
+  return (st.diag && st.diag.length) ? st.diag.join("\n") : "";
+};
 const diagLines = () => diagText().split("\n").filter(Boolean);
 
 /* 先让侧车进入正常状态（宿主连接流程） */
@@ -166,9 +173,11 @@ const conn = await sidecar("connection/connect", {
 /* 等 UI 起来 */
 await waitFor(() => window.MDNotes && window.MDNotes.storage, 6000, "storage.js 加载");
 await waitFor(() => {
-  const bar = $("diag-bar");
-  return bar && (bar.getAttribute("data-sev") === "ok" || diagText().includes("[FAIL]"));
-}, 20000, "诊断条给出最终结论");
+  const s = window.MDNotes && window.MDNotes.storage;
+  if (!s) return false;
+  const st = s.status();
+  return st.backend !== "unknown" || diagText().includes("[FAIL]");
+}, 20000, "存储初始化给出最终结论");
 await sleep(600); // 等 persist(false) / seed 落盘
 
 const S = window.MDNotes.storage;
@@ -193,23 +202,14 @@ check("缺失元素只记一条（可选）日志，且不中断其它绑定",
 check("界面 JS 没有未捕获错误",
   window.__testErrors.length === 0, window.__testErrors.join(" ;; "));
 
-/* ---------- 3) 置顶诊断条的结论 ---------- */
-const bar = $("diag-bar");
-check("诊断条在页面最上方且可见", !!bar && bar.hidden === false);
-check("诊断条位置在 #main 的第一个子节点",
-  $("main").firstElementChild === bar, "实际：" + ($("main").firstElementChild || {}).id);
-check("诊断条判为正常（data-sev=ok）", bar.getAttribute("data-sev") === "ok",
-  "data-sev=" + bar.getAttribute("data-sev"));
-check("诊断条结论直说「正在落盘到」",
-  $("diag-verdict").textContent.includes("笔记正在落盘到"), $("diag-verdict").textContent);
-check("诊断条摘要含后端/桥接/侧车/目录",
-  /后端 sidecar/.test($("diag-summary").textContent)
-  && /桥接 已连接/.test($("diag-summary").textContent)
-  && /侧车 已握手/.test($("diag-summary").textContent)
-  && $("diag-summary").textContent.includes(STORAGE_DIR.replace(/\\/g, "\\")),
-  $("diag-summary").textContent);
-check("状态栏胶囊也同步为已保存",
-  $("store-text").textContent.includes("已保存到存储目录"), $("store-text").textContent);
+/* ---------- 3) 置顶诊断条已下线（上线形态），状态栏胶囊仍在 ---------- */
+check("置顶诊断条不在页面上（已下线）", !$("diag-bar") && !$("diag-log"));
+check("#main 的第一个子节点是工具栏（不再被诊断条占位）",
+  ($("main").firstElementChild || {}).className === "toolbar",
+  "实际：" + ($("main").firstElementChild || {}).className);
+check("状态栏胶囊仍在且标题正确",
+  !!$("store-status") && $("store-text").textContent.includes("已保存到存储目录"),
+  $("store-text").textContent);
 
 /* ---------- 4) storage 状态 ---------- */
 check("后端 = sidecar", st.backend === "sidecar", "backend=" + st.backend);
@@ -255,20 +255,21 @@ await sleep(50);
 check("点状态栏胶囊能打开「存储状态」弹窗",
   $("modal").hidden === false && $("modal").textContent.includes("存储状态"),
   $("modal").textContent.slice(0, 60));
-check("弹窗里带逐步诊断日志", $("modal").textContent.includes("存储诊断日志"));
+check("弹窗里默认【不】显示逐步诊断日志（上线收口）",
+  !$("modal").textContent.includes("存储诊断日志"));
 $("modal").querySelectorAll("button").length
   && [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "关闭").click();
 check("状态弹窗能关闭", $("modal").hidden === true);
 
-/* ---------- 8) 诊断条交互 ---------- */
-const logWasHidden = $("diag-log").hidden;
-$("diag-toggle").click();
-await sleep(20);
-check("「收起/展开日志」按钮生效", $("diag-log").hidden === !logWasHidden,
-  "before=" + logWasHidden + " after=" + $("diag-log").hidden);
-check("诊断报告可生成（含环境快照）",
+/* ---------- 8) 诊断能力仍在（只是不上屏） ---------- */
+check("诊断报告仍可生成（含环境快照，供排障）",
   S.report().includes("--- 环境 ---") && S.report().includes("typeof window.dbxPlugin"),
   "");
+check("诊断日志仍完整保留在存储层（只是不上屏）",
+  diagText().includes("前端 boot 开始") && diagText().includes("侧车握手 notes/ping"),
+  diagLines().slice(-2).join(" ;; "));
+check("历史诊断入口未泄漏到页面（无 diag-toggle/复制诊断按钮）",
+  !$("diag-toggle") && !$("diag-copy") && !$("diag-detail"));
 
 /* ---------- 汇总 ---------- */
 console.log("\n===== 通过 " + pass.length + " 项 =====");
@@ -277,10 +278,9 @@ if (fail.length) {
   console.log("\n===== 失败 " + fail.length + " 项 =====");
   fail.forEach((f) => console.log("  FAIL  " + f));
 }
-console.log("\n----- 页面置顶诊断条内容 -----");
-console.log("  verdict: " + $("diag-verdict").textContent);
-console.log("  summary: " + $("diag-summary").textContent);
+console.log("\n----- 页面状态（诊断条已下线，日志取自存储层） -----");
 console.log("  status : " + $("store-text").textContent);
+console.log("  backend: " + st.backend + " · dir=" + st.storageDir + " · lastError=" + (st.lastError || "无"));
 diagLines().forEach((l) => console.log("  " + l));
 console.log("\n----- 磁盘产物 -----");
 (function walk(d, pre = "") {

@@ -1,0 +1,19 @@
+/backend/target/
+# 构建产物：由 go build 生成，不进仓库；但打包（_buildpkg.js）与两个 e2e 需要它存在于磁盘
+/backend/*.exe
+/bin/
+/frontend/node_modules/
+/frontend/dist/
+/scripts/__pycache__/
+/dist/
+/ui/
+!/ui/
+!/ui/.gitkeep
+.dbx-repository-signing-key.env
+.idea/
+.mimosa
+.pnpm-store/
+bin/
+.dbx-dev/
+frontend/.pnpm-store/
+.zcode/

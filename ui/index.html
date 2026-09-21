@@ -39,20 +39,22 @@
     </aside>
 
     <main id="main">
-      <!-- 置顶诊断条：存储后端 / 桥接 / 侧车 / 目录 与逐步日志，默认展开在页面最上方 -->
-      <div id="diag-bar" class="diag-bar" data-sev="warn">
-        <div class="diag-head">
-          <span class="diag-dot"></span>
-          <span class="diag-title">存储诊断</span>
-          <span id="diag-verdict" class="diag-verdict">正在初始化…</span>
-          <span id="diag-summary" class="diag-summary"></span>
-          <span class="diag-spacer"></span>
-          <button id="diag-toggle" class="diag-btn">收起日志</button>
-          <button id="diag-copy" class="diag-btn">复制诊断</button>
-          <button id="diag-detail" class="diag-btn">状态详情</button>
-        </div>
-        <pre id="diag-log" class="diag-log">（等待日志…）</pre>
-      </div>
+      <!-- 置顶诊断条：上线时已关闭（app.js 里 SHOW_DIAG_BAR=false）。
+           日后需要排障：把 app.js 的 SHOW_DIAG_BAR 改成 true，并把下面这段取消注释即可。
+           <div id="diag-bar" class="diag-bar" data-sev="warn">
+             <div class="diag-head">
+               <span class="diag-dot"></span>
+               <span class="diag-title">存储诊断</span>
+               <span id="diag-verdict" class="diag-verdict">正在初始化…</span>
+               <span id="diag-summary" class="diag-summary"></span>
+               <span class="diag-spacer"></span>
+               <button id="diag-toggle" class="diag-btn">收起日志</button>
+               <button id="diag-copy" class="diag-btn">复制诊断</button>
+               <button id="diag-detail" class="diag-btn">状态详情</button>
+             </div>
+             <pre id="diag-log" class="diag-log">（等待日志…）</pre>
+           </div>
+      -->
 
       <div class="toolbar">
         <input id="title" class="title-input" placeholder="笔记标题" />

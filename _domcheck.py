@@ -40,9 +40,8 @@ if bad:
     sys.exit(1)
 print("OK：没有对缺失元素取属性的代码。")
 
-# 关键元素清单（置顶诊断条依赖）
-CRITICAL = ["main", "diag-bar", "diag-verdict", "diag-summary", "diag-log",
-            "diag-toggle", "diag-copy", "diag-detail", "store-status", "store-text",
+# 关键元素清单（置顶诊断条已下线，不再要求 diag-* 元素）
+CRITICAL = ["main", "store-status", "store-text",
             "tree", "editor", "title"]
 missing = [c for c in CRITICAL if c not in live_ids]
 if missing:

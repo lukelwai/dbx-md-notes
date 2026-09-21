@@ -56,12 +56,28 @@ if (badRefs.length) {
   process.exit(1);
 }
 
-// (b) 关键 UI 节点必须在 index.html 里真实存在（诊断条要靠它们显示）
-const CRITICAL = ["main", "diag-bar", "diag-verdict", "diag-summary", "diag-log",
-  "diag-toggle", "diag-copy", "diag-detail", "store-status", "store-text", "tree", "editor", "title"];
+// (b) 关键 UI 节点必须在 index.html 里真实存在
+const CRITICAL = ["main", "store-status", "store-text", "tree", "editor", "title"];
 const missingCritical = CRITICAL.filter(id => !liveIds.has(id));
 if (missingCritical.length) {
   console.error("\n[FATAL] index.html 缺少关键元素：" + missingCritical.join(", ") + "\n");
+  process.exit(1);
+}
+
+// (d) 置顶诊断条的开关必须与 HTML 一致：开关 true 就得有元素，false 就不能有，
+//     否则「开关开了但元素被注释」= renderDiag 静默 return，排障时白等一场。
+const showDiagBar = /var\s+SHOW_DIAG_BAR\s*=\s*(true|false)/.exec(appCode);
+if (!showDiagBar) {
+  console.error("\n[FATAL] app.js 缺少 SHOW_DIAG_BAR 开关（置顶诊断条的状态无法自证）。\n");
+  process.exit(1);
+}
+const diagBarLive = liveIds.has("diag-bar");
+if (showDiagBar[1] === "true" && !diagBarLive) {
+  console.error("\n[FATAL] SHOW_DIAG_BAR=true 但 index.html 里 #diag-bar 仍被注释：请一并放开。\n");
+  process.exit(1);
+}
+if (showDiagBar[1] === "false" && diagBarLive) {
+  console.error("\n[FATAL] SHOW_DIAG_BAR=false 但 index.html 里 #diag-bar 仍存在：上线不该出现。\n");
   process.exit(1);
 }
 
