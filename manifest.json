@@ -1,0 +1,122 @@
+{
+  "$schema": "https://raw.githubusercontent.com/t8y2/dbx/main/plugins/manifest.schema.json",
+  "manifest_version": 1,
+  "id": "com.example.mdnotes",
+  "name": "MD 笔记",
+  "version": "0.5.4",
+  "publisher": "example",
+  "description": "Markdown 笔记连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记由 Sidecar 落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
+  "icon": "assets/plugin.svg",
+  "engines": {
+    "dbx": ">=0.5.68",
+    "host_api": "1"
+  },
+  "permissions": [
+    "host.filesystem"
+  ],
+  "entrypoints": {
+    "ui": {
+      "root": "ui",
+      "entry": "ui/index.html"
+    },
+    "backend": {
+      "executable": "bin/dbx-plugin-mdnotes"
+    }
+  },
+  "contributions": [
+    {
+      "type": "workbench",
+      "id": "com.example.mdnotes.main",
+      "label": "MD 笔记",
+      "description": "Markdown 笔记工作台",
+      "icon": "assets/plugin.svg"
+    },
+    {
+      "type": "connection-provider",
+      "id": "com.example.mdnotes.conn",
+      "label": "MD 笔记",
+      "description": "创建一个 MD 笔记连接，用于打开独立的 Markdown 笔记工作台。",
+      "icon": "assets/plugin.svg",
+      "database_type": "mdnotes",
+      "workbench": "com.example.mdnotes.main",
+      "capabilities": [
+        "test",
+        "connect",
+        "disconnect"
+      ],
+      "fields": [
+        {
+          "key": "display_name",
+          "label": "连接名称",
+          "type": "text",
+          "binding": "name",
+          "required": true,
+          "default": "MD 笔记",
+          "description": "显示在连接列表中的名称。"
+        },
+        {
+          "key": "storage_dir",
+          "label": "笔记存储目录",
+          "type": "text",
+          "binding": "config",
+          "required": true,
+          "default": "",
+          "placeholder": "例如：D:\\notes",
+          "description": "必填。Sidecar 会把每条笔记写成该目录下的真实 .md 文件、文件夹写成子目录，结构索引存于 .mdnotes/meta.json。点击右侧文件夹按钮选择本地目录，或手动填写绝对路径。",
+          "picker": {
+            "kind": "directory"
+          }
+        }
+      ]
+    },
+    {
+      "type": "filesystem-provider",
+      "id": "com.example.mdnotes.fs",
+      "label": "MD 笔记",
+      "description": "把笔记以 .md 文件形式暴露给 DBX 通用文件管理器（mdnotes://）。",
+      "icon": "assets/plugin.svg",
+      "schemes": [
+        "mdnotes"
+      ],
+      "root_uri": "mdnotes:/",
+      "capabilities": [
+        "read",
+        "write",
+        "delete",
+        "rename",
+        "mkdir"
+      ]
+    }
+  ],
+  "localizations": {
+    "en": {
+      "name": "MD Notes",
+      "description": "Markdown notes connection type: create an MD Notes connection to open the notebook workbench. Notes are persisted by the sidecar into the storage directory and exposed as an mdnotes:// virtual filesystem.",
+      "contributions": {
+        "com.example.mdnotes.main": {
+          "label": "MD Notes",
+          "description": "Markdown notes workbench"
+        },
+        "com.example.mdnotes.conn": {
+          "label": "MD Notes",
+          "description": "Create an MD Notes connection to open a standalone Markdown notebook workbench.",
+          "fields": {
+            "display_name": {
+              "label": "Connection name",
+              "description": "Name shown in the connection list."
+            },
+            "storage_dir": {
+              "label": "Storage directory",
+              "description": "Required. The sidecar writes each note as a real .md file and each folder as a subfolder under this directory; the structure index is stored in .mdnotes/meta.json. Click the folder button to pick a local directory, or type an absolute path.",
+              "placeholder": "e.g. /Users/me/notes"
+            }
+          }
+        },
+        "com.example.mdnotes.fs": {
+          "label": "MD Notes",
+          "description": "Expose notes as .md files in the DBX file manager (mdnotes://)."
+        }
+      }
+    }
+  }
+}

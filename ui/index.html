@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MD 笔记</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="light">
+  <div id="app">
+    <aside id="sidebar">
+      <div class="side-head">
+        <div class="brand">
+          <span class="brand-mark">MD</span>
+          <span>笔记</span>
+        </div>
+        <button id="btn-theme" class="icon-btn" title="切换明暗（本地预览用）">&#9686;</button>
+      </div>
+
+      <div class="side-tools">
+        <button id="btn-new-note" class="primary">+ 新建笔记</button>
+        <button id="btn-new-folder">+ 文件夹</button>
+      </div>
+
+      <div class="search-wrap">
+        <input id="search" type="search" placeholder="全文检索标题与正文…" autocomplete="off" />
+        <button id="search-clear" class="clear-btn" title="清除检索" hidden>&#215;</button>
+      </div>
+
+      <div id="tree" class="tree"></div>
+
+      <div id="sel-actions" class="sel-actions" hidden>
+        <button id="btn-rename">重命名</button>
+        <button id="btn-move">移动到…</button>
+        <button id="btn-delete" class="danger">删除</button>
+      </div>
+
+      <div id="side-foot" class="side-foot"></div>
+    </aside>
+
+    <main id="main">
+      <!-- 置顶诊断条：存储后端 / 桥接 / 侧车 / 目录 与逐步日志，默认展开在页面最上方 -->
+      <div id="diag-bar" class="diag-bar" data-sev="warn">
+        <div class="diag-head">
+          <span class="diag-dot"></span>
+          <span class="diag-title">存储诊断</span>
+          <span id="diag-verdict" class="diag-verdict">正在初始化…</span>
+          <span id="diag-summary" class="diag-summary"></span>
+          <span class="diag-spacer"></span>
+          <button id="diag-toggle" class="diag-btn">收起日志</button>
+          <button id="diag-copy" class="diag-btn">复制诊断</button>
+          <button id="diag-detail" class="diag-btn">状态详情</button>
+        </div>
+        <pre id="diag-log" class="diag-log">（等待日志…）</pre>
+      </div>
+
+      <div class="toolbar">
+        <input id="title" class="title-input" placeholder="笔记标题" />
+        <div class="toolbar-right">
+          <button id="btn-table-note">为表新建笔记</button>
+          <button id="btn-insert-sql">插入 SQL 块</button>
+          <!-- <button id="btn-copy-sql">复制 SQL 到 DBX</button> -->
+          <span class="sep"></span>
+          <button id="btn-export-md">导出 .md</button>
+          <button id="btn-import-md">导入 .md</button>
+          <button id="btn-backup-zip">备份 zip</button>
+        </div>
+      </div>
+
+      <div id="panes" class="panes" data-view="split" data-empty="1">
+        <textarea id="editor" class="editor" placeholder="在此输入 Markdown…（支持标题、列表、代码块、表格、加粗、引用；```sql 代码块会高亮）" spellcheck="false"></textarea>
+        <div id="preview" class="preview markdown-body"></div>
+        <div id="empty" class="empty">
+          <div class="empty-card">
+            <div class="empty-mark">📝</div>
+            <h2>开始记录你的第一篇笔记</h2>
+            <p>在左侧选择一条笔记，或新建一篇开始。</p>
+            <button id="btn-empty-new" class="primary big">+ 新建笔记</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="statusbar">
+        <span id="store-status" class="store-status"><span class="store-dot"></span><span id="store-text">存储检测中…</span></span>
+        <span id="note-meta" class="note-meta"></span>
+        <span class="spacer"></span>
+        <span class="view-switch" id="view-switch">
+          <button data-view="edit">编辑</button>
+          <button data-view="split" class="on">双栏</button>
+          <button data-view="preview">预览</button>
+        </span>
+        <span id="counter" class="counter">0 字</span>
+      </div>
+    </main>
+  </div>
+
+  <!-- 通用弹窗：重命名 / 确认 / 移动 / 导出降级 -->
+  <div id="modal" class="modal" hidden></div>
+
+  <!-- 目录树右键菜单 -->
+  <div id="ctx-menu" class="ctx-menu" hidden></div>
+
+  <!-- 从表新建笔记 -->
+  <div id="table-modal" class="modal" hidden>
+    <div class="modal-card">
+      <h3>为此表新建笔记</h3>
+      <label class="m-label">表名</label>
+      <input id="tn-table" class="m-input" placeholder="例如 users" />
+      <label class="m-label">字段清单（每行一个，可写 “列名 类型”）</label>
+      <textarea id="tn-fields" class="m-text" placeholder="id bigint&#10;name varchar(64)&#10;created_at timestamp"></textarea>
+      <label class="m-label">保存到</label>
+      <select id="tn-folder" class="m-input"></select>
+      <div class="modal-actions">
+        <button id="tn-cancel">取消</button>
+        <button id="tn-ok" class="primary">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <input id="file-input" type="file" accept=".md,.markdown,.txt" multiple hidden />
+
+  <script src="sql-highlight.js"></script>
+  <script src="markdown.js"></script>
+  <script src="storage.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
