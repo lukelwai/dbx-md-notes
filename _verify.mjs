@@ -77,6 +77,7 @@ const checks = [
   ["无 _ 前缀临时文件混入", !es.some((e) => /(^|\/)_/.test(e.name))],
 ];
 const st = get("ui/storage.js").toString("utf8");
+const exeStr = (get(exeRel) || Buffer.alloc(0)).toString("latin1");
 const ap = get("ui/app.js").toString("utf8");
 const ix = get("ui/index.html").toString("utf8");
 const cs = get("ui/styles.css").toString("utf8");
@@ -103,6 +104,18 @@ checks.push(
     !liveIds.has("btn-import-md") && !liveIds.has("file-input")],
   ["app.js 开关 ENABLE_IMPORT=false", /var\s+ENABLE_IMPORT\s*=\s*false/.test(apCode)],
   ["导入代码保留，便于一行放出来", ap.includes("function handleImport(") && ap.includes("function pickImportFiles(")],
+  ["app.js 没有重复的函数声明（后者会静默覆盖前者）",
+    (() => {
+      const seen = {};
+      apCode.split(/\r?\n/).forEach((l) => {
+        const m = /^  function (\w+)\s*\(/.exec(l);
+        if (m) { seen[m[1]] = (seen[m[1]] || 0) + 1; }
+      });
+      return Object.keys(seen).filter((k) => seen[k] > 1).length === 0;
+    })()],
+  ["前端删除走显式 deletedIds（不再靠「不在快照里」推断删除）", ap.includes("deletedIds")],
+  ["打包的侧车含「显式删除」语义（deletedIds 结构标签）", exeStr.includes("deletedIds")],
+  ["打包的侧车含回收站语义（trash）", exeStr.includes("trash")],
   ["app.js 用安全绑定 click()/on()（缺失元素不再连坐）", apCode.includes("function on(id, evName, handler, optional)")],
   ["app.js 没有对缺失元素直接取属性", dangling.length === 0, dangling.join(",")],
   ["app.js 捕获页面级未处理异常", apCode.includes("unhandledrejection") && apCode.includes('window.addEventListener("error"')],

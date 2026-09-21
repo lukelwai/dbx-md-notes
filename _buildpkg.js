@@ -64,6 +64,23 @@ if (missingCritical.length) {
   process.exit(1);
 }
 
+// (b2) 同名函数声明：后声明的会静默覆盖前面的，函数名撞车不会有任何提示。
+//      2026-09-21 事故：confirmModal 定义两次（一个收字符串、一个收数组），
+//      后者顶掉前者 → removeNode 传字符串进去 `lines.join is not a function` 抛错，
+//      表现成「点删除毫无反应」。
+const fnLines = {};
+appCode.split(/\r?\n/).forEach((l, i) => {
+  const m = /^  function (\w+)\s*\(/.exec(l);
+  if (m) { (fnLines[m[1]] = fnLines[m[1]] || []).push(i + 1); }
+});
+const dupFns = Object.keys(fnLines).filter(k => fnLines[k].length > 1);
+if (dupFns.length) {
+  console.error("\n[FATAL] app.js 存在重复的函数声明（后者会覆盖前者，必须改名）：");
+  dupFns.forEach(k => console.error(`   - ${k}  (行 ${fnLines[k].join(", ")})`));
+  console.error("");
+  process.exit(1);
+}
+
 // (d) 置顶诊断条的开关必须与 HTML 一致：开关 true 就得有元素，false 就不能有，
 //     否则「开关开了但元素被注释」= renderDiag 静默 return，排障时白等一场。
 const showDiagBar = /var\s+SHOW_DIAG_BAR\s*=\s*(true|false)/.exec(appCode);

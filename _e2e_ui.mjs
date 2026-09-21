@@ -102,8 +102,11 @@ child.stdout.on("data", (chunk) => {
   }
 });
 child.stderr.on("data", (c) => process.stderr.write("[sidecar] " + c));
+/** notes/save 的入参流水（断言「删除是否显式声明了 deletedIds」这类协议语义） */
+const saveCallsLog = [];
 function sidecar(method, params) {
   const id = String(++seq);
+  if (method === "notes/save") { saveCallsLog.push(params || {}); }
   return new Promise((resolve, reject) => {
     waiting.set(id, { resolve, reject });
     child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} }) + "\n");
@@ -511,6 +514,49 @@ if (bkCall && fs.existsSync(bkCall.path)) {
     check("恢复前留下了退路快照（pre-restore-*.zip）",      fs.readdirSync(STORAGE_DIR).some((f) => f.startsWith("pre-restore-")),
       fs.readdirSync(STORAGE_DIR).join(", "));
     [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "关闭").click();
+  }
+}
+
+/* ---------- 13) 删除必须显式声明 deletedIds（后端只认显式删除，不再「不在快照里就删」） ---------- */
+{
+  const countMd = () => (function w(d) {
+    return fs.readdirSync(d, { withFileTypes: true }).reduce((sum, e) => {
+      if (e.isDirectory()) { return e.name === ".mdnotes" ? sum : sum + w(path.join(d, e.name)); }
+      return sum + (e.name.endsWith(".md") ? 1 : 0);
+    }, 0);
+  })(STORAGE_DIR);
+
+  const before = countMd();
+  const beforeSaves = saveCallsLog.length;
+
+  const victim = [...doc.querySelectorAll("#tree .node")].find((el) => el.getAttribute("data-type") === "note");
+  check("删除用例：目录树里有可删的笔记", !!victim);
+  if (victim) {
+    victim.click();
+    await sleep(30);
+    $("btn-delete").click();
+    await waitFor(() => $("modal").hidden === false && /确定删除/.test($("modal").textContent), 4000, "删除确认框");
+    const okBtn = [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "删除");
+    check("删除确认框有「删除」按钮", !!okBtn, $("modal").textContent.slice(0, 60));
+    if (okBtn) {
+      okBtn.click();
+      await sleep(600);
+      const saved = saveCallsLog.slice(beforeSaves).reverse()
+        .find((p) => p.data && Array.isArray(p.data.deletedIds) && p.data.deletedIds.length > 0);
+      check("删除时把节点 id 放进 deletedIds（否则后端不会删）", !!saved,
+        "最近一次 save 的 deletedIds=" + JSON.stringify((saveCallsLog[saveCallsLog.length - 1] || {}).data
+          && (saveCallsLog[saveCallsLog.length - 1].data || {}).deletedIds));
+      check("删除后磁盘上的 .md 少了一个", countMd() === before - 1, before + " -> " + countMd());
+
+      const trashRoot = path.join(STORAGE_DIR, ".mdnotes", "trash");
+      const trashCount = fs.existsSync(trashRoot)
+        ? (function w(d) {
+          return fs.readdirSync(d, { withFileTypes: true }).reduce((sum, e) =>
+            e.isDirectory() ? sum + w(path.join(d, e.name)) : sum + (e.name.endsWith(".md") ? 1 : 0), 0);
+        })(trashRoot)
+        : 0;
+      check("被删的正文进了回收站（可捞回，不是销毁）", trashCount >= 1, "trash 里的 .md 数=" + trashCount);
+    }
   }
 }
 

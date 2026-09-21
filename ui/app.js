@@ -56,7 +56,15 @@
     expanded: {},
     view: "split",
     query: "",
-    loaded: false
+    loaded: false,
+    // 本会话内【用户显式删掉】的节点 id（删文件夹时含其全部子节点）。
+    // 只累积、不清理：多带一次已删的 id 是无害的，而漏带就会让删除不生效。
+    // 后端只认这个列表，绝不把「快照里没有」当成删除 —— 否则另一端（同目录的另一个
+    // 连接）保存旧快照时就会把这边新建的笔记删掉。
+    deletedIds: [],
+    // 正文没读上来的笔记 id：这类笔记【不许】把正文写回（会把磁盘上的正文清空）。
+    // 由 notes/load 的 contentMissing 标记填充。
+    contentMissing: {}
   };
   var manualTheme = null;
   var configuredDir = "";   // 连接表单里填的「笔记存储目录」（宿主传入，前端只能读不能写）
@@ -131,9 +139,18 @@
 
   // ---------------- 持久化 ----------------
   function snapshot() {
+    // 正文没读上来的笔记【省略 content 字段】：后端见到"没带正文"就原样保留磁盘内容。
+    // 若这里发一个空串，后端会把它当作"用户把正文清空了"写盘 —— 笔记就真的没了。
+    var nodes = state.nodes.map(function (n) {
+      if (n.type !== "note" || !state.contentMissing[n.id]) { return n; }
+      var copy = {};
+      for (var k in n) { if (k !== "content") { copy[k] = n[k]; } }
+      return copy;
+    });
     return {
       version: 2,
-      nodes: state.nodes,
+      nodes: nodes,
+      deletedIds: state.deletedIds.slice(),
       activeId: state.activeId,
       expanded: state.expanded,
       view: state.view,
@@ -143,6 +160,20 @@
   function persist(debounce) {
     if (!state.loaded) { return; }
     S.save(snapshot(), debounce !== false);
+  }
+
+  /** 记录哪些笔记的正文没读上来（后端 contentMissing 标记），并给出可见提示 */
+  function indexContentMissing(nodes) {
+    state.contentMissing = {};
+    var n = 0;
+    (nodes || []).forEach(function (x) {
+      if (x && x.type === "note" && x.contentMissing) { state.contentMissing[x.id] = true; n++; }
+    });
+    if (n) {
+      toast(n + " 篇笔记的正文文件读不到，已冻结（不会写回覆盖）。请检查存储目录。", "warn");
+      S.log("载入发现正文缺失的笔记", false, n + " 篇已冻结");
+    }
+    return n;
   }
 
   /**
@@ -160,6 +191,9 @@
     state.activeId = d.activeId || null;
     state.expanded = d.expanded || {};
     if (d.view) { setView(d.view); }
+    // 重新载入 = 世界被整体替换：此前累积的删除记录作废，缺正文标记按新数据重建。
+    state.deletedIds = [];
+    indexContentMissing(d.nodes);
     if (state.activeId && !byId(state.activeId)) { state.activeId = null; }
     if (!state.activeId) {
       var firsts = state.nodes.filter(function (n) { return n.type === "note"; });
@@ -583,8 +617,16 @@
     panes.setAttribute("data-empty", "0");
     title.disabled = false;
     editor.disabled = false;
+    // 正文没读上来的笔记：冻结编辑。这种笔记绝不会把正文写回磁盘（见 snapshot），
+    // 若还允许输入，用户敲的内容会静默丢失；冻结 + 说明才是诚实的做法。
+    var frozen = !!state.contentMissing[n.id];
+    editor.readOnly = frozen;
+    editor.placeholder = frozen
+      ? "⚠ 这篇笔记的正文文件读不到（可能被移动/改名/占用），已冻结编辑以防覆盖。请检查「笔记存储目录」。"
+      : "在此输入 Markdown…（支持标题、列表、代码块、表格、加粗、引用；```sql 代码块会高亮）";
     if (title.value !== n.name && document.activeElement !== title) { title.value = n.name; }
-    if (editor.value !== (n.content || "") && document.activeElement !== editor) { editor.value = n.content || ""; }
+    if (frozen) { editor.value = ""; }
+    else if (editor.value !== (n.content || "") && document.activeElement !== editor) { editor.value = n.content || ""; }
     renderPreview();
     updateCounter();
   }
@@ -933,6 +975,9 @@
         state.nodes.forEach(function (x) { if (isDescendant(x.id, n.id)) { kill[x.id] = true; } });
       }
       state.nodes = state.nodes.filter(function (x) { return !kill[x.id]; });
+      Object.keys(kill).forEach(function (id) {
+        if (state.deletedIds.indexOf(id) < 0) { state.deletedIds.push(id); }
+      });
       if (kill[state.activeId]) { state.activeId = null; }
       persist(false);
       render();
@@ -1149,15 +1194,22 @@
     });
   }
 
-  /** 简单确认框（恢复这种破坏性操作必须先问一句） */
-  function confirmModal(title, lines, okText) {
+  /**
+   * 多行内容确认框（恢复这种破坏性操作要先逐条列清楚）。
+   *
+   * 注意：这里**不能**也叫 confirmModal —— 同名函数声明会被后声明的覆盖，
+   * 而上面那个 confirmModal(title, message, ...) 收的是字符串。
+   * 一旦重名，先声明的那个被顶掉，removeNode 传字符串进来就会
+   * `lines.join is not a function` 抛错 → 「删除」按钮点了毫无反应（弹窗都出不来）。
+   */
+  function confirmListModal(title, lines, okText) {
     return new Promise(function (resolve) {
       var done = function (v) { closeModal(); resolve(v); };
       openModal(function (card) {
         var h = document.createElement("h3"); h.textContent = title; card.appendChild(h);
         var pre = document.createElement("pre");
         pre.className = "m-pre";
-        pre.textContent = lines.join("\n");
+        pre.textContent = (lines || []).join("\n");
         card.appendChild(pre);
         modalButtons(card, [
           { text: "取消", onClick: function () { done(false); } },
@@ -1203,7 +1255,7 @@
         "同名笔记会被覆盖，目录树索引会被替换为备份时的状态。",
         "恢复前会自动另存一份 pre-restore-*.zip 作为退路。"
       ];
-      return confirmModal("确认恢复？", lines, "开始恢复");
+      return confirmListModal("确认恢复？", lines, "开始恢复");
     }).then(function (ok) {
       if (!ok) { toast("已取消恢复"); return null; }
       // 恢复前先把挂起的防抖写落定，避免「恢复完成」之后又被那一帧旧快照覆盖。
@@ -1657,16 +1709,20 @@
       renderDiag(S.status());
 
       var data = res.data;
+      var seeded = false;
       if (data && Object.prototype.toString.call(data.nodes) === "[object Array]") {
         state.nodes = data.nodes;
         state.activeId = data.activeId || null;
         state.expanded = data.expanded || {};
         state.view = data.view || "split";
+        state.deletedIds = [];
+        indexContentMissing(data.nodes);
       } else if (res.firstRun && S.status().persistent) {
         // 只有「确实没有任何数据」时才放示例笔记；读成空数组绝不重新初始化，
         // 否则用户删空笔记后每次打开都会把示例塞回来。
         // 存储不可持久化时也不放：否则会塞进一批根本存不下的假数据，掩盖真实故障。
         seed();
+        seeded = true;
       }
       state.loaded = true;
       if (!S.status().persistent) {
@@ -1683,11 +1739,35 @@
       handleHostContext();
       render();
       renderDiag(S.status());
-      // 立即写一次，用于验证后端真的可写；失败会在状态栏/诊断条显示
-      persist(false);
+      // 启动时【绝不】保存整份快照。
+      //
+      // 以前这里无条件 persist(false)"写一次验证可写"，代价是把本实例的旧快照推成权威状态：
+      // 同一个存储目录被第二个连接打开时，先打开的那个实例只要被打开一次，就会用它手里的
+      // 旧列表覆盖索引（新增的笔记当场被删，改过的正文被回滚）。
+      // 现在拆成两件事：
+      //   - 可写性 → 用非破坏性的 notes/probe（只写 .mdnotes/ 里的探针文件）
+      //   - 真有新数据要落盘（空目录首用 seed 了示例笔记）→ 才保存
+      probeWritable();
+      if (seeded) { persist(false); }
     }).catch(function (e) {
       S.log("存储 init() 收尾异常", false, (e && e.message) || String(e));
       try { renderDiag(S.status()); } catch (e2) { /* ignore */ }
+    });
+  }
+
+  /** 非破坏性可写性探测：不碰索引、不碰正文，只写 .mdnotes/ 下的探针文件 */
+  function probeWritable() {
+    return S.invoke("notes/probe", {}).then(function (r) {
+      if (r && r.ok === false) {
+        S.log("存储可写性探测失败", false, (r && r.error) || "未知原因");
+      } else {
+        S.log("存储可写性探测通过", true, (r && r.dir) || "");
+      }
+      return !!(r && r.ok !== false);
+    }).catch(function (e) {
+      // 老版本侧车没有 notes/probe：退化成 ping（同样不写任何数据）
+      S.log("可写性探测不可用，回退 ping", false, (e && e.message) || String(e));
+      return true;
     });
   }
 

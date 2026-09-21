@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	dbxpluginsdk "github.com/example/mdnotes/dbxsdk"
@@ -36,7 +37,7 @@ import (
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
 	pluginID      = "com.example.mdnotes"
-	pluginVersion = "0.6.1" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginVersion = "0.6.2" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -132,6 +133,19 @@ func (plugin *plugin) Handle(
 
 	case "notes/path":
 		return map[string]any{"path": metaPath(), "dir": notesDir(), "configured": dirConfigured()}, nil
+
+	case "notes/probe":
+		// 轻量可写性探测：只往 .mdnotes/ 写一个探针文件，不碰索引、不碰正文。
+		// 前端启动时用它替代「保存一次完整快照」——后者会把该实例的旧快照推成权威状态，
+		// 在多实例共用同一目录时就是数据被回滚/删除的触发点。
+		if err := os.MkdirAll(metaDir(), 0o755); err != nil {
+			return map[string]any{"ok": false, "dir": notesDir(), "error": err.Error()}, nil
+		}
+		probe := filepath.Join(metaDir(), ".write-probe")
+		if err := os.WriteFile(probe, []byte(time.Now().Format(time.RFC3339)), 0o644); err != nil {
+			return map[string]any{"ok": false, "dir": notesDir(), "error": err.Error()}, nil
+		}
+		return map[string]any{"ok": true, "dir": notesDir(), "configured": dirConfigured()}, nil
 
 	case "notes/setDir":
 		var p struct {
@@ -607,21 +621,34 @@ func writeContent(abs, content string) error {
 // ---------------- 笔记快照（前端传入） ----------------
 
 type snapNode struct {
-	ID        string  `json:"id"`
-	Type      string  `json:"type"`
-	Name      string  `json:"name"`
-	ParentID  *string `json:"parentId"`
-	Content   string  `json:"content"`
+	ID       string  `json:"id"`
+	Type     string  `json:"type"`
+	Name     string  `json:"name"`
+	ParentID *string `json:"parentId"`
+	// Content 用指针：nil = 「这次没带正文」，后端绝不写盘。
+	//
+	// 为什么不用 string：string 的零值是空串，与「用户真的把正文清空了」无法区分。
+	// 一旦前端因为某个文件读不到而拿不到正文，快照里就会是一个空串，
+	// 保存时把磁盘上的正文覆盖成空 —— 这就是「笔记内容被清空」的机制。
+	// 用指针后，「省略字段」本身就能表达"别动它"，不需要额外标志位配合。
+	Content   *string `json:"content"`
 	CreatedAt string  `json:"createdAt"`
 	UpdatedAt string  `json:"updatedAt"`
 }
 
 type snap struct {
-	Version  int             `json:"version"`
-	Nodes    []snapNode      `json:"nodes"`
-	ActiveID string          `json:"activeId"`
-	Expanded map[string]bool `json:"expanded"`
-	View     string          `json:"view"`
+	Version int        `json:"version"`
+	Nodes   []snapNode `json:"nodes"`
+	// DeletedIDs 是前端【显式】声明要删的节点 id（删除文件夹时含其全部子节点）。
+	//
+	// 绝不能把「不在 Nodes 里」当成删除：一个存储目录可能同时被多个连接/实例使用，
+	// 旧实例手里的快照天然缺少对方刚建的笔记，而它一保存就会把那些笔记删掉
+	// （2026-09-21 事故：重复用同一个目录建连接 → 一部分笔记被清空）。
+	// 语义改成「未知 ≠ 要删」后，这种行为就不可能再发生。
+	DeletedIDs []string        `json:"deletedIds"`
+	ActiveID   string          `json:"activeId"`
+	Expanded   map[string]bool `json:"expanded"`
+	View       string          `json:"view"`
 }
 
 // computeRelPath 由父子链推导相对路径（文件名已 sanitize）。
@@ -645,6 +672,16 @@ func computeRelPath(n snapNode, byID map[string]snapNode) string {
 	return filepath.Join(segs...)
 }
 
+// trashPath 给出「回收站」里的目标路径。
+//
+// 删除一律不硬删：先移到 <storage_dir>/.mdnotes/trash/<时间戳>/<原相对路径>。
+// 这样任何一次误删（旧快照、并发实例、以后的逻辑 bug）都还能捞回来，
+// 代价只是磁盘上多一份历史副本。
+func trashPath(root, rel string) string {
+	stamp := time.Now().Format("20060102-150405")
+	return filepath.Join(root, ".mdnotes", "trash", stamp, rel)
+}
+
 func saveNotes(raw json.RawMessage) error {
 	var s snap
 	if err := json.Unmarshal(raw, &s); err != nil {
@@ -664,36 +701,53 @@ func saveNotes(raw json.RawMessage) error {
 		prevByID[n.ID] = n
 	}
 	inByID := map[string]snapNode{}
-	for _, n := range s.Nodes {
-		inByID[n.ID] = n
-	}
-
-	// 1) 删除：在 prev 中、不在 incoming 中的节点
 	incomingSet := map[string]bool{}
 	for _, n := range s.Nodes {
+		inByID[n.ID] = n
 		incomingSet[n.ID] = true
 	}
-	var delNotes, delFolders []MetaNode
-	for _, old := range prev.Nodes {
-		if !incomingSet[old.ID] {
-			if old.Type == "note" {
-				delNotes = append(delNotes, old)
-			} else {
-				delFolders = append(delFolders, old)
-			}
+	deletedSet := map[string]bool{}
+	for _, id := range s.DeletedIDs {
+		deletedSet[id] = true
+	}
+
+	// 1) 删除：只处理前端【显式】声明要删的 id，且一律移入回收站而非硬删。
+	//
+	// 这里以前是「凡是不在快照里的节点就删文件」，语义上等于把「我没见过」当成
+	// 「用户要删」—— 一个存储目录被两个连接同时打开时，后打开的那个实例只要保存一次
+	// （打开工作台就会保存），就会把对方新建的笔记从磁盘上删掉。
+	// 现在：未知 ≠ 要删；真要删必须显式说。
+	trashed := 0
+	seenTrashDir := false
+	for id := range deletedSet {
+		old, ok := prevByID[id]
+		if !ok || strings.TrimSpace(old.File) == "" {
+			continue
 		}
+		abs := filepath.Join(root, old.File)
+		if _, err := os.Stat(abs); err != nil {
+			continue // 磁盘上本来就没有，不必处理
+		}
+		dst := trashPath(root, old.File)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			continue
+		}
+		if err := os.Rename(abs, dst); err != nil {
+			// 移不动就【不删】：宁可留下一个孤儿文件，也不做不可逆的销毁。
+			sidecarTrace(fmt.Sprintf("notes/save trash FAILED rel=%s err=%v（已保留原文件）", old.File, err))
+			continue
+		}
+		trashed++
+		seenTrashDir = true
 	}
-	for _, n := range delNotes {
-		_ = os.Remove(filepath.Join(root, n.File))
-	}
-	for _, n := range delFolders {
-		_ = os.RemoveAll(filepath.Join(root, n.File))
+	if seenTrashDir {
+		sidecarTrace(fmt.Sprintf("notes/save trashed=%d dir=%s", trashed, filepath.Join(root, ".mdnotes", "trash")))
 	}
 
 	// 2) 笔记：新建/移动文件 + 仅内容变化时写盘
 	result := []MetaNode{}
 	for _, n := range s.Nodes {
-		if n.Type != "note" {
+		if n.Type != "note" || deletedSet[n.ID] {
 			continue
 		}
 		mn := MetaNode{ID: n.ID, Type: "note", Name: n.Name, ParentID: n.ParentID, CreatedAt: n.CreatedAt, UpdatedAt: n.UpdatedAt}
@@ -708,19 +762,22 @@ func saveNotes(raw json.RawMessage) error {
 			_ = os.MkdirAll(filepath.Dir(absTarget), 0o755)
 			_ = os.Rename(filepath.Join(root, old.File), absTarget)
 		}
-		hs := contentHash(n.Content)
-		if !isUnchanged(absTarget, hs) {
-			if err := writeContent(absTarget, n.Content); err != nil {
-				return err
+		mn.File = toRel(root, absTarget)
+		// Content == nil：这次没带正文（前端没读到 / 不打算改）→ 绝不用空内容覆盖磁盘。
+		if n.Content != nil {
+			hs := contentHash(*n.Content)
+			if !isUnchanged(absTarget, hs) {
+				if err := writeContent(absTarget, *n.Content); err != nil {
+					return err
+				}
 			}
 		}
-		mn.File = toRel(root, absTarget)
 		result = append(result, mn)
 	}
 
 	// 3) 文件夹：新建/移动目录（子项已在第 2 步自行落到新位置，这里只需清理旧空目录）
 	for _, n := range s.Nodes {
-		if n.Type != "folder" {
+		if n.Type != "folder" || deletedSet[n.ID] {
 			continue
 		}
 		mn := MetaNode{ID: n.ID, Type: "folder", Name: n.Name, ParentID: n.ParentID, CreatedAt: n.CreatedAt, UpdatedAt: n.UpdatedAt}
@@ -731,12 +788,28 @@ func saveNotes(raw json.RawMessage) error {
 			mn.File = rel
 		} else if rel != old.File {
 			_ = os.MkdirAll(filepath.Join(root, rel), 0o755)
-			_ = os.RemoveAll(filepath.Join(root, old.File))
+			// os.Remove 只删空目录；若里面还留着被保留（未在快照里）的子节点就删不掉 —— 这正是我们要的。
+			_ = os.Remove(filepath.Join(root, old.File))
 			mn.File = rel
 		} else {
 			mn.File = old.File
 		}
 		result = append(result, mn)
+	}
+
+	// 4) 保留：既不在快照里、也没被显式删除的节点，原样留着。
+	//    它们通常是「另一个连接/实例里刚建的」——本实例没见过，不等于用户想删。
+	preserved := 0
+	for _, old := range prev.Nodes {
+		if incomingSet[old.ID] || deletedSet[old.ID] {
+			continue
+		}
+		result = append(result, old)
+		preserved++
+	}
+
+	if preserved > 0 {
+		sidecarTrace(fmt.Sprintf("notes/save preserved=%d（快照里没带、但未声明删除，保持原样）", preserved))
 	}
 
 	newMeta := Meta{Version: s.Version, ActiveID: s.ActiveID, Expanded: s.Expanded, View: s.View, Nodes: result}
@@ -771,7 +844,11 @@ func notesLoad() (any, *dbxpluginsdk.PluginError) {
 			if data, err := os.ReadFile(filepath.Join(notesDir(), mn.File)); err == nil {
 				node["content"] = string(data)
 			} else {
-				node["content"] = ""
+				// 读不到正文时【绝不能】回一个空串：前端会把空串当作"这篇笔记的正文"
+				// 原样保存回去，磁盘上的正文就被清空了。这里明确标记 missing，
+				// 前端据此既不显示为可编辑的空笔记、也不会把空内容写回。
+				node["contentMissing"] = true
+				sidecarTrace(fmt.Sprintf("notes/load 正文读不到（已冻结，不会写回）：rel=%s err=%v", mn.File, err))
 			}
 			node["file"] = mn.File
 		}
@@ -1685,15 +1762,24 @@ func handleNewNoteForTable(params json.RawMessage) (any, *dbxpluginsdk.PluginErr
 
 // ---------------- 原子写 ----------------
 
+var tmpSeq uint64
+
 func writeAtomic(path string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
+	// tmp 名必须唯一：同一个存储目录可能被多个侧车实例同时写（重复建「同一个目录」的连接），
+	// 共用一个固定名（path+".tmp"）会让两个进程互相覆盖对方的半成品，
+	// 甚至把对方的半截内容 rename 成正式文件 —— 索引损坏的后果可能是整库被误删。
+	tmp := fmt.Sprintf("%s.%d.%d.tmp", path, os.Getpid(), atomic.AddUint64(&tmpSeq, 1))
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // resolveMetadata 构造启动时向宿主宣告的身份。

@@ -40,6 +40,21 @@ if bad:
     sys.exit(1)
 print("OK：没有对缺失元素取属性的代码。")
 
+# 同名函数声明会被后声明的覆盖：先声明的那个静默失效。
+# 2026-09-21 实际事故：confirmModal 被定义两次（一个收字符串、一个收数组），
+# 后者顶掉前者 → 删除按钮里传字符串进去直接 `lines.join is not a function` 抛错，
+# 表现成「点删除毫无反应」。函数名撞车不会有任何提示，只能靠静态检查兜住。
+sigs = {}
+for m in re.finditer(r'^  function (\w+)\s*\(', js_code, flags=re.M):
+    sigs.setdefault(m.group(1), []).append(js_code[:m.start()].count("\n") + 1)
+dupes = {k: v for k, v in sigs.items() if len(v) > 1}
+if dupes:
+    print("!! 重复的函数声明（后者会覆盖前者，必须改名）:")
+    for name, lines in dupes.items():
+        print("   - %s  定义于 app.js 行 %s" % (name, ", ".join(str(x) for x in lines)))
+    sys.exit(1)
+print("OK：没有重复的函数声明。")
+
 # 关键元素清单（置顶诊断条已下线，不再要求 diag-* 元素）
 CRITICAL = ["main", "store-status", "store-text",
             "tree", "editor", "title"]

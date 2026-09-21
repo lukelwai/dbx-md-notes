@@ -330,6 +330,83 @@ function check(name, cond, extra) {
       n1 ? n1.name : "(找不到 n1)");
   }
 
+  /* ---------- 数据安全：删除必须显式，未知 ≠ 要删（2026-09-21 事故回归） ----------
+   * 事故：同一个存储目录被重复创建连接时，后打开的那个实例一保存（打开工作台就会保存），
+   * 就把它手里的旧快照推成权威状态 —— 对方新建的笔记被从磁盘上真删掉、改过的正文被回滚。
+   */
+  const findIn = (root, name) => {
+    if (!fs.existsSync(root)) return "";
+    for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+      const fp = path.join(root, e.name);
+      if (e.isDirectory()) { const hit = findIn(fp, name); if (hit) return hit; }
+      else if (e.name === name) return fp;
+    }
+    return "";
+  };
+
+  const base = await S.reload();
+  const baseSnap = {
+    version: 2,
+    nodes: base.data.nodes.map((n) => Object.assign({}, n)),
+    activeId: base.data.activeId, expanded: base.data.expanded || {}, view: "split",
+  };
+
+  // 模拟「另一个连接」在同一目录里新增一篇笔记（直接打侧车），然后本实例拿着旧快照再保存
+  const otherRel = "另一个连接写的.md";
+  await sidecar("notes/save", {
+    storage_dir: STORAGE_DIR,
+    data: {
+      version: 2,
+      nodes: baseSnap.nodes.concat([{
+        id: "other", type: "note", name: "另一个连接写的", parentId: null,
+        content: "别删我", createdAt: "x", updatedAt: "x",
+      }]),
+      activeId: "n1", expanded: {}, view: "split",
+    },
+  });
+  const otherFile = path.join(STORAGE_DIR, otherRel);
+  check("另一实例写入的笔记已落盘", fs.existsSync(otherFile), otherFile);
+
+  await S.save(baseSnap, false);
+  check("本实例保存旧快照后，另一实例的笔记仍在磁盘（未知 ≠ 要删）",
+    fs.existsSync(otherFile), otherFile);
+  const merged = await S.reload();
+  check("本实例保存旧快照后，另一实例的笔记仍在索引里",
+    !!(merged.data && merged.data.nodes && merged.data.nodes.some((n) => n.id === "other")),
+    "nodes=" + (merged.data && merged.data.nodes ? merged.data.nodes.length : "null"));
+
+  // 正文文件读不到 → 必须标记 contentMissing，且绝不能回一个空串被原样写回（那等于清空笔记）
+  fs.rmSync(otherFile);
+  const miss = await S.reload();
+  const missNode = miss.data && miss.data.nodes ? miss.data.nodes.find((n) => n.id === "other") : null;
+  check("正文读不到时标记 contentMissing", !!missNode && missNode.contentMissing === true,
+    JSON.stringify(missNode));
+  check("正文读不到时不返回 content 字段（空串会被写回覆盖）",
+    !!missNode && missNode.content === undefined, JSON.stringify(missNode && missNode.content));
+
+  await S.save({
+    version: 2,
+    nodes: (miss.data.nodes || []).map((n) => Object.assign({}, n)),
+    activeId: miss.data.activeId, expanded: miss.data.expanded || {}, view: "split",
+  }, false);
+  check("「没带正文」的保存不会凭空造出空文件", !fs.existsSync(otherFile), otherFile);
+
+  // 显式删除：只有 deletedIds 点名的才删，而且进回收站（可捞回），不是销毁
+  const del = await S.reload();
+  const delSnap = {
+    version: 2,
+    nodes: (del.data.nodes || []).map((n) => Object.assign({}, n)).filter((n) => n.id !== "n1"),
+    deletedIds: ["n1"],
+    activeId: null, expanded: del.data.expanded || {}, view: "split",
+  };
+  await S.save(delSnap, false);
+  check("显式删除后原位置不再有该文件", !fs.existsSync(file), file);
+  const trashed = findIn(path.join(STORAGE_DIR, ".mdnotes", "trash"), "重构验证.md");
+  check("显式删除的正文进了回收站（可捞回）", !!trashed, trashed || "(回收站里找不到)");
+  if (trashed) {
+    check("回收站里的正文完好", fs.readFileSync(trashed, "utf8").includes("存储链路已打通"));
+  }
+
   console.log("\n===== 通过 " + pass.length + " 项 =====");
   pass.forEach((p) => console.log("  PASS  " + p));
   if (fail.length) {

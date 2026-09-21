@@ -363,6 +363,190 @@ func cloneSnap(s map[string]any) map[string]any {
 
 func ptr(s string) *string { return &s }
 
+// ---------------- 数据安全回归（2026-09-21 事故：重复选同一个目录建连接，笔记被清空） ----------------
+
+func metaNames(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, ".mdnotes", "meta.json"))
+	if err != nil {
+		t.Fatalf("读 meta 失败：%v", err)
+	}
+	var m struct {
+		Nodes []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("解析 meta 失败：%v", err)
+	}
+	out := map[string]string{}
+	for _, n := range m.Nodes {
+		out[n.ID] = n.Name
+	}
+	return out
+}
+
+// 在任意子目录里按文件名找文件（回收站里的副本也能找到）
+func findByName(t *testing.T, root, name string) string {
+	t.Helper()
+	hit := ""
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || hit != "" {
+			return nil
+		}
+		if d.Name() == name {
+			hit = p
+		}
+		return nil
+	})
+	return hit
+}
+
+func twoNotesSnapshot() map[string]any {
+	return map[string]any{
+		"version":  2,
+		"activeId": "a",
+		"nodes": []map[string]any{
+			{"id": "f1", "type": "folder", "name": "示例", "parentId": nil, "createdAt": "c", "updatedAt": "u"},
+			{"id": "a", "type": "note", "name": "A笔记", "parentId": nil, "content": "aaa", "createdAt": "c", "updatedAt": "u"},
+			{"id": "b", "type": "note", "name": "B笔记", "parentId": ptr("f1"), "content": "bbb", "createdAt": "c", "updatedAt": "u"},
+		},
+	}
+}
+
+// 一个目录被两个连接同时用时，后保存的一方带的是「旧快照」（不含对方新建的笔记）。
+// 旧实现把「不在快照里」当成「要删」，于是那些笔记被从磁盘上真删掉。
+// 新语义：未知 ≠ 要删，只有显式 deletedIds 才删。
+func TestSavePreservesNodesMissingFromSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	seedLibrary(t, dir)
+
+	// 模拟另一实例新增第 4 个节点
+	withNew := twoNotesSnapshot()
+	withNew["nodes"] = append(withNew["nodes"].([]map[string]any), map[string]any{
+		"id": "new", "type": "note", "name": "新增笔记", "parentId": nil,
+		"content": "new body", "createdAt": "c", "updatedAt": "u",
+	})
+	call(t, "notes/save", map[string]any{"storage_dir": dir, "data": withNew})
+
+	// 旧快照（只有 3 个节点）保存 —— 绝不能把「新增笔记」删掉
+	call(t, "notes/save", map[string]any{"storage_dir": dir, "data": twoNotesSnapshot()})
+
+	if b, err := os.ReadFile(filepath.Join(dir, "新增笔记.md")); err != nil || string(b) != "new body" {
+		t.Fatalf("未被声明删除的笔记被清掉了：err=%v content=%q", err, b)
+	}
+	if _, ok := metaNames(t, dir)["new"]; !ok {
+		t.Fatalf("索引里也应保留该节点：%v", metaNames(t, dir))
+	}
+}
+
+// 显式声明删除的节点：从索引里去掉，正文进回收站（可捞回），不是硬删。
+func TestSaveDeletesOnlyExplicitAndGoesToTrash(t *testing.T) {
+	dir := t.TempDir()
+	seedLibrary(t, dir)
+
+	s := twoNotesSnapshot()
+	delete(s, "activeId")
+	// 只留 a 和 f1，并显式声明删 b
+	s["nodes"] = []map[string]any{
+		{"id": "f1", "type": "folder", "name": "示例", "parentId": nil, "createdAt": "c", "updatedAt": "u"},
+		{"id": "a", "type": "note", "name": "A笔记", "parentId": nil, "content": "aaa", "createdAt": "c", "updatedAt": "u"},
+	}
+	s["deletedIds"] = []string{"b"}
+	call(t, "notes/save", map[string]any{"storage_dir": dir, "data": s})
+
+	names := metaNames(t, dir)
+	if _, ok := names["b"]; ok {
+		t.Fatalf("已声明删除的节点仍在索引里：%v", names)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "示例", "B笔记.md")); err == nil {
+		t.Fatalf("原位置不应还有该文件")
+	}
+	trashed := findByName(t, filepath.Join(dir, ".mdnotes", "trash"), "B笔记.md")
+	if trashed == "" {
+		t.Fatalf("删除应进回收站而不是销毁，但在 .mdnotes/trash 下找不到")
+	}
+	if b, err := os.ReadFile(trashed); err != nil || string(b) != "bbb" {
+		t.Fatalf("回收站里的正文应完好：err=%v content=%q", err, b)
+	}
+	// a 不受影响
+	if _, err := os.Stat(filepath.Join(dir, "A笔记.md")); err != nil {
+		t.Fatalf("未涉及删除的笔记不该被影响：%v", err)
+	}
+}
+
+// 快照里不带 content = 「这次别动正文」。
+// 绝不能当成「用户把正文清空了」，否则任何一次读失败都会把磁盘上的正文清掉。
+func TestSaveWithoutContentKeepsFileContent(t *testing.T) {
+	dir := t.TempDir()
+	seedLibrary(t, dir)
+
+	// 只改名，不带 content 字段
+	s := map[string]any{
+		"version": 2,
+		"nodes": []map[string]any{
+			{"id": "f1", "type": "folder", "name": "示例", "parentId": nil, "createdAt": "c", "updatedAt": "u"},
+			{"id": "a", "type": "note", "name": "A笔记改名", "parentId": nil, "createdAt": "c", "updatedAt": "u"},
+			{"id": "b", "type": "note", "name": "B笔记", "parentId": ptr("f1"), "createdAt": "c", "updatedAt": "u"},
+		},
+	}
+	call(t, "notes/save", map[string]any{"storage_dir": dir, "data": s})
+
+	b, err := os.ReadFile(filepath.Join(dir, "A笔记改名.md"))
+	if err != nil {
+		t.Fatalf("改名后文件应存在：%v", err)
+	}
+	if string(b) != "aaa" {
+		t.Fatalf("不带 content 的保存把正文改掉了：%q（应为 aaa）", b)
+	}
+}
+
+// 正文文件读不到时：load 必须标记 contentMissing，而不是回一个空串
+// （空串会被前端当作「正文就是空的」原样保存，等于把笔记清空）。
+func TestLoadMarksMissingContentInsteadOfEmpty(t *testing.T) {
+	dir := t.TempDir()
+	seedLibrary(t, dir)
+
+	if err := os.Remove(filepath.Join(dir, "A笔记.md")); err != nil {
+		t.Fatalf("准备缺失文件失败：%v", err)
+	}
+	res := call(t, "notes/load", map[string]any{"storage_dir": dir}).(map[string]any)
+	nodes := res["data"].(map[string]any)["nodes"].([]map[string]any)
+	var a map[string]any
+	for _, n := range nodes {
+		if n["id"] == "a" {
+			a = n
+		}
+	}
+	if a == nil {
+		t.Fatalf("找不到节点 a")
+	}
+	if a["contentMissing"] != true {
+		t.Fatalf("正文读不到时必须标记 contentMissing，实际：%v", a)
+	}
+	if _, has := a["content"]; has {
+		t.Fatalf("正文读不到时不应返回 content 字段（空串会被写回覆盖磁盘）：%v", a["content"])
+	}
+
+	// 把这份「没带正文」的快照存回去：不能凭空造出一个空文件
+	call(t, "notes/save", map[string]any{"storage_dir": dir, "data": map[string]any{
+		"version": 2,
+		"nodes": []map[string]any{
+			{"id": "f1", "type": "folder", "name": "示例", "parentId": nil, "createdAt": "c", "updatedAt": "u"},
+			{"id": "a", "type": "note", "name": "A笔记", "parentId": nil, "createdAt": "c", "updatedAt": "u"},
+			{"id": "b", "type": "note", "name": "B笔记", "parentId": ptr("f1"), "createdAt": "c", "updatedAt": "u"},
+		},
+	}})
+	if _, err := os.Stat(filepath.Join(dir, "A笔记.md")); err == nil {
+		t.Fatalf("不应因为「没带正文」就造出一个空文件")
+	}
+	// 没被动的 B 仍完好
+	if b, err := os.ReadFile(filepath.Join(dir, "示例", "B笔记.md")); err != nil || string(b) != "bbb" {
+		t.Fatalf("B 笔记应完好：err=%v %q", err, b)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
