@@ -64,7 +64,9 @@
           <!-- <button id="btn-copy-sql">复制 SQL 到 DBX</button> -->
           <span class="sep"></span>
           <button id="btn-export-md">导出 .md</button>
-          <button id="btn-import-md">导入 .md</button>
+          <!-- 导入功能暂时下线（app.js 里 ENABLE_IMPORT=false）。
+               恢复：把 app.js 的 ENABLE_IMPORT 改成 true，并把下面两处取消注释。 -->
+          <!-- <button id="btn-import-md">导入 .md</button> -->
           <button id="btn-backup-zip">备份 zip</button>
           <button id="btn-restore-zip">恢复备份…</button>
         </div>
@@ -121,7 +123,7 @@
   </div>
 
   <div id="toast" class="toast" hidden></div>
-  <input id="file-input" type="file" accept=".md,.markdown,.txt" multiple hidden />
+  <!-- <input id="file-input" type="file" accept=".md,.markdown,.txt" multiple hidden /> -->
   <input id="backup-input" type="file" accept=".zip" hidden />
 
   <script src="sql-highlight.js"></script>

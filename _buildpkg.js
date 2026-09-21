@@ -81,6 +81,24 @@ if (showDiagBar[1] === "false" && diagBarLive) {
   process.exit(1);
 }
 
+// (d2) 功能开关 ENABLE_IMPORT 必须与 HTML 一致：开关关掉就该连入口一起摘掉，
+//      否则会出现「按钮在、点了没反应」——比没有按钮更让人困惑。
+const enableImport = /var\s+ENABLE_IMPORT\s*=\s*(true|false)/.exec(appCode);
+if (!enableImport) {
+  console.error("\n[FATAL] app.js 缺少 ENABLE_IMPORT 开关（导入功能的启用状态无法自证）。\n");
+  process.exit(1);
+}
+const importBtnLive = liveIds.has("btn-import-md");
+const importInputLive = liveIds.has("file-input");
+if (enableImport[1] === "false" && (importBtnLive || importInputLive)) {
+  console.error("\n[FATAL] ENABLE_IMPORT=false 但 index.html 里 #btn-import-md 或 #file-input 仍存在：请一并注释掉。\n");
+  process.exit(1);
+}
+if (enableImport[1] === "true" && !(importBtnLive && importInputLive)) {
+  console.error("\n[FATAL] ENABLE_IMPORT=true 但 index.html 里 #btn-import-md / #file-input 被注释：请一并放开。\n");
+  process.exit(1);
+}
+
 // (c) 前端 UI 版本号必须与 manifest 一致，避免「装的是新版、跑的是旧代码」
 const uiVer = (storeSrc.match(/var UI_VERSION = "([^"]+)"/) || [])[1];
 if (uiVer !== ver) {

@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "com.example.mdnotes",
   "name": "MD 笔记",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "publisher": "example",
   "description": "Markdown 笔记连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记由 Sidecar 落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
   "icon": "assets/plugin.svg",

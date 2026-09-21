@@ -680,6 +680,13 @@
   var SHOW_DIAG_BAR = false;
   var SHOW_DIAG_LOG_IN_MODAL = false;   // 存储状态弹窗里的「存储诊断日志」面板，默认隐藏
 
+  /* ============ 功能开关：导入 .md（暂时下线） ============
+   * 2026-09-21：导入功能容易出问题，先摘掉入口（工具栏按钮 / 右键菜单 / 隐藏 file input 全下线），
+   * 代码与处理逻辑全部保留。要恢复：把下面改成 true，并把 index.html 里 #btn-import-md 与
+   * #file-input 两处注释取消即可 —— 打包闸门会校验「开关与 HTML 必须一致」，不一致直接拒绝打包。
+   */
+  var ENABLE_IMPORT = false;
+
   var diagOpen = true;
   var diagLastSev = null;
 
@@ -975,7 +982,7 @@
     if (!n) {
       item("新建笔记", function () { createNote("未命名笔记", null, ""); });
       item("新建文件夹", function () { newFolderFlow(null); });
-      item("导入 .md 文件", function () { $("file-input").click(); });
+      if (ENABLE_IMPORT) { item("导入 .md 文件", pickImportFiles); }
       item("备份全部为 zip", backupAll);
       item("从备份恢复…", restoreFlow);
     } else if (n.type === "folder") {
@@ -1221,6 +1228,13 @@
       toast("恢复失败：" + (e && e.message ? e.message : e), "warn");
     });
   }
+  /** 打开「导入 .md」的文件选择框。导入功能下线时不会走到这里；
+   *  取元素用安全写法（先赋值再判空），避免元素缺失时抛错把调用方连坐。 */
+  function pickImportFiles() {
+    var fi = $("file-input");
+    if (fi) { fi.click(); } else { toast("导入功能已停用", "warn"); }
+  }
+
   function handleImport(files) {
     if (!files || !files.length) { return; }
     var parentId = targetFolderId();
@@ -1449,7 +1463,8 @@
     // 否则整个 bindEvents 会在此处中断（2026-09-21 实际事故：所有按钮点不动 + 笔记从不落盘）。
     click("btn-copy-sql", copySqlToDbx, true);
     click("btn-export-md", function () { exportNote(activeNote()); });
-    click("btn-import-md", function () { var fi = $("file-input"); if (fi) { fi.click(); } });
+    // 导入功能暂时下线（ENABLE_IMPORT=false）：入口与绑定一起摘掉，避免出现点了没反应的按钮。
+    if (ENABLE_IMPORT) { click("btn-import-md", pickImportFiles); }
     click("btn-backup-zip", backupAll);
     click("btn-restore-zip", restoreFlow);
 
@@ -1460,10 +1475,12 @@
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { submitTableModal(); }
     });
 
-    on("file-input", "onchange", function (e) {
-      handleImport(e.target.files);
-      e.target.value = "";
-    });
+    if (ENABLE_IMPORT) {
+      on("file-input", "onchange", function (e) {
+        handleImport(e.target.files);
+        e.target.value = "";
+      });
+    }
 
     on("backup-input", "onchange", function (e) {
       handleRestoreFile(e.target.files);
