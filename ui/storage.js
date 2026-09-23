@@ -53,10 +53,12 @@
   var BRIDGE_TIMEOUT = 8000;  // 等 window.dbxPlugin 注入
   var BRIDGE_PAYLOAD_LIMIT = 1.9 * 1024 * 1024; // 宿主上限 2 MiB，留出余量
   var SAVE_DEBOUNCE = 400;
+  // AI 调用的超时单独放宽：模型常常要几十秒，沿用 30 秒的通用超时会把正常请求掐死。
+  var AI_TIMEOUT = 180000;
 
   /* ============ 诊断日志（页面置顶诊断条 + 状态弹窗共用，实时刷新） ============ */
 
-  var UI_VERSION = "0.7.1";   // 打包脚本会校验它与 manifest.version 一致
+  var UI_VERSION = "0.8.1";   // 打包脚本会校验它与 manifest.version 一致
   var T0 = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
   /** 自模块加载起的毫秒数（给每条日志打上相对时间，能看出卡在哪一步） */
   function since() {
@@ -804,6 +806,70 @@
     /** 直接调侧车 RPC（导出/备份走后端落盘），resolve 侧车 result */
     invoke: function (method, params) {
       return rpc(method, params, RPC_TIMEOUT);
+    },
+
+    /* ---------------- AI（走侧车；密钥不下发前端，前端也永远拿不到） ----------------
+     *
+     * 设计取舍：不再依赖宿主的 host.ai（内置 AI 面板）。
+     *   - 那个接口只「打开对话」，不返回模型回复、不暴露模型配置，做不了「结果写回笔记」；
+     *   - 它需要 host.ai 权限，而权限是静态的 —— 旧宿主遇到未知权限会在安装阶段直接拒绝，
+     *     等于为了一个用不上的入口把所有 <0.6.20 的用户挡在门外。
+     * 现在只保留一条路：配置第三方模型，由侧车持有密钥并直连。
+     */
+
+    /** 侧车当前的 AI 配置与状态（不含密钥，只有一个 hasKey 布尔） */
+    aiConfig: function () {
+      return rpc("ai/config", {}, RPC_TIMEOUT).catch(function () { return null; });
+    },
+
+    /**
+     * 更新 AI 配置。cfg 可含：
+     *   enabled / provider / baseUrl / model / apiKey / systemPrompt / timeoutSecs / maxChars
+     *   rememberKey（true = 允许把密钥写进本机插件数据目录）
+     *   clearKey（true = 清掉本机保存的密钥）
+     * persist=false 时只改内存（供「测试连接」用，不落盘）。
+     */
+    aiSetConfig: function (cfg, persist) {
+      var payload = { persist: persist !== false };
+      var src = cfg || {};
+      ["enabled", "provider", "baseUrl", "model", "apiKey", "systemPrompt",
+        "timeoutSecs", "maxChars", "rememberKey", "clearKey"].forEach(function (k) {
+          if (src[k] !== undefined) { payload[k] = src[k]; }
+        });
+      return rpc("ai/setConfig", payload, RPC_TIMEOUT);
+    },
+
+    /**
+     * 用一组参数（留空则用当前生效配置）发一次最小请求。
+     * **不会改动生效配置** —— 测坏了不会把用户原本能用的配置搞坏。
+     */
+    aiTest: function (cfg) {
+      return rpc("ai/test", cfg || {}, AI_TIMEOUT);
+    },
+
+    /** 清掉本机（面板）保存的配置，回到「以连接配置为准」 */
+    aiResetConfig: function () {
+      return rpc("ai/resetConfig", {}, RPC_TIMEOUT);
+    },
+
+    /** 让 AI 处理一段文本。task ∈ analyze|polish|continue|ask */
+    aiChat: function (task, text, instruction) {
+      return rpc("ai/chat", { task: task, text: text, instruction: instruction || "" }, AI_TIMEOUT);
+    },
+
+    /** AI 调用的超时（毫秒），供 UI 显示进度预期 */
+    AI_TIMEOUT: AI_TIMEOUT,
+
+    /* ---------------- UI 偏好（面板宽度等，存在插件数据目录，不进笔记目录） ---------------- */
+
+    getPrefs: function () {
+      return rpc("ui/getPrefs", {}, RPC_TIMEOUT)
+        .then(function (r) { return (r && r.prefs) || {}; })
+        .catch(function () { return {}; });
+    },
+
+    setPrefs: function (prefs) {
+      return rpc("ui/setPrefs", { prefs: prefs || {} }, RPC_TIMEOUT).catch(function () { return null; });
     },
 
     /** 宿主是否提供「另存为」对话框（决定导出/备份能否让用户自选目录） */

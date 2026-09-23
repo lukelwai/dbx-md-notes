@@ -1,11 +1,19 @@
 {
-  "name": "MD 笔记",
-  "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
+  "name": "AI.MD 笔记",
+  "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。内置 AI 助手（右侧常驻栏），可接入任意 OpenAI 兼容 / Anthropic / Ollama 模型对笔记做分析、润色、续写与问答。",
   "icon": "assets/plugin.svg",
-  "tags": ["md", "notes", "files", "storage"],
-  "permissions": ["host.filesystem"],
+  "tags": [
+    "md",
+    "notes",
+    "files",
+    "storage",
+    "ai"
+  ],
+  "permissions": [
+    "host.filesystem"
+  ],
   "source": "https://github.com/lukelwai/dbx-md-notes",
   "homepage": "https://github.com/lukelwai/dbx-md-notes",
   "license": "Apache-2.0",
-  "releaseNotes": "Initial release."
+  "releaseNotes": "AI 助手改为右侧常驻栏（不再弹窗）：可执行分析 / 润色 / 续写 / 问 AI，结果支持插入到光标、替换选中、追加到末尾、复制；并可直接在栏内配置或更新模型参数。目录区、笔记区与 AI 区之间可拖动调整宽度。去掉对 DBX 内置 AI 的依赖，最低宿主版本回到 0.5.68。"
 }

@@ -407,6 +407,110 @@ function check(name, cond, extra) {
     check("回收站里的正文完好", fs.readFileSync(trashed, "utf8").includes("存储链路已打通"));
   }
 
+  /* ---------- AI：侧车直连模型（含"密钥不下发前端"与"错误可读"） ----------
+   * 前端在沙箱里没有网络，模型调用全部发生在侧车；密钥只经宿主生命周期通道到后端。
+   * 这里用真的侧车 + 一个假的模型 HTTP 服务，把整条链路跑通。
+   */
+  const httpMod = await import("node:http");
+  let aiLastAuth = "", aiLastPath = "", aiLastBody = "";
+  const modelSrv = httpMod.createServer((req, res) => {
+    aiLastAuth = req.headers["authorization"] || "";
+    aiLastPath = req.url || "";
+    let b = "";
+    req.on("data", (c) => { b += c; });
+    req.on("end", () => {
+      aiLastBody = b;
+      res.setHeader("content-type", "application/json");
+      if (aiLastPath.indexOf("/401/") >= 0) {
+        res.statusCode = 401;
+        res.end('{"error":{"message":"invalid api key sk-e2e-secret-123456"}}');
+        return;
+      }
+      res.end(JSON.stringify({
+        model: "fake-1",
+        choices: [{ message: { content: "## 要点\n- 第一条" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 9 },
+      }));
+    });
+  });
+  await new Promise((r) => modelSrv.listen(0, "127.0.0.1", r));
+  const aiPort = modelSrv.address().port;
+
+  async function connectAI(baseUrl) {
+    return sidecar("connection/connect", {
+      connection: {
+        id: "e2e-ai", name: "MD 笔记",
+        external_config: {
+          storage_dir: STORAGE_DIR, ai_enabled: true, ai_provider: "openai",
+          ai_base_url: baseUrl, ai_model: "fake-1", ai_max_chars: 500,
+        },
+        connection_secrets: { ai_api_key: "sk-e2e-secret-123456" },
+      },
+      connectionId: "e2e-ai",
+    });
+  }
+
+  await connectAI(`http://127.0.0.1:${aiPort}/v1`);
+  const aiSt = await S.aiConfig();
+  check("ai/config：已配置且 ready", !!aiSt && aiSt.ready === true && aiSt.model === "fake-1" && aiSt.hasKey === true,
+    JSON.stringify(aiSt));
+  check("ai/config：不回传密钥本体", !!aiSt && JSON.stringify(aiSt).indexOf("sk-e2e-secret") < 0, JSON.stringify(aiSt));
+  check("ai/config：标明密钥来自连接配置", !!aiSt && aiSt.keyFrom === "connection", JSON.stringify(aiSt && aiSt.keyFrom));
+  check("ai/config：未用本机覆盖（overridden 为空）", !!aiSt && (aiSt.overridden || []).length === 0,
+    JSON.stringify(aiSt && aiSt.overridden));
+
+  const aiChat = await S.aiChat("analyze", "这是笔记正文");
+  check("ai/chat：拿到结构化结果",
+    !!aiChat && String(aiChat.content).indexOf("要点") >= 0, JSON.stringify(aiChat).slice(0, 140));
+  check("ai/chat：打到 OpenAI 兼容路径 /v1/chat/completions", aiLastPath === "/v1/chat/completions", aiLastPath);
+  check("ai/chat：侧车带上了 Authorization", aiLastAuth === "Bearer sk-e2e-secret-123456", aiLastAuth);
+  check("ai/chat：提示词里带上了笔记正文", aiLastBody.indexOf("这是笔记正文") >= 0, aiLastBody.slice(0, 120));
+  check("密钥没有出现在前端上下文里", JSON.stringify(workbenchContext).indexOf("sk-e2e") < 0);
+
+  // 超长正文应被截断（ai_max_chars=500）
+  const longChat = await S.aiChat("analyze", "字".repeat(1200));
+  check("超长正文被截断并如实回报", !!longChat && longChat.truncated === true && longChat.sentChars === 500,
+    JSON.stringify({ t: longChat && longChat.truncated, n: longChat && longChat.sentChars }));
+
+  // 错误路径：必须是可读中文，且不泄漏密钥
+  await connectAI(`http://127.0.0.1:${aiPort}/401/v1`);
+  let aiErr = "";
+  try { await S.aiChat("analyze", "正文"); } catch (e) { aiErr = String((e && e.message) || e); }
+  check("鉴权失败给出可读中文错误", aiErr.indexOf("鉴权失败") >= 0, aiErr);
+  check("错误信息不泄漏密钥", aiErr.indexOf("sk-e2e-secret") < 0, aiErr);
+
+  /* ---- 面板里的运行时配置（ai/setConfig / ai/test / ai/resetConfig） ---- */
+  await connectAI(`http://127.0.0.1:${aiPort}/v1`);
+  const saved = await S.aiSetConfig({ model: "panel-model", persist: true });
+  check("ai/setConfig：模型被本机配置覆盖", !!saved && saved.model === "panel-model", JSON.stringify(saved && saved.model));
+  check("ai/setConfig：未改动的字段仍来自连接（baseUrl）",
+    !!saved && String(saved.baseUrl || "").indexOf("/v1") > 0, String(saved && saved.baseUrl));
+  check("ai/setConfig：overridden 标出被覆盖的字段",
+    !!saved && (saved.overridden || []).indexOf("model") >= 0, JSON.stringify(saved && saved.overridden));
+
+  const prefsEmpty = await S.getPrefs();
+  check("ui/getPrefs：能读到偏好对象", !!prefsEmpty && typeof prefsEmpty === "object",
+    JSON.stringify(prefsEmpty));
+
+  const tested = await S.aiTest({ baseUrl: `http://127.0.0.1:${aiPort}/v1`, model: "fake-1" });
+  check("ai/test：未保存的参数也能试连成功", !!tested && tested.success === true, JSON.stringify(tested).slice(0, 160));
+  const afterTest = await S.aiConfig();
+  check("ai/test：不修改生效配置", !!afterTest && afterTest.model === "panel-model", String(afterTest && afterTest.model));
+
+  const reset = await S.aiResetConfig();
+  check("ai/resetConfig：回到以连接配置为准", !!reset && reset.model === "fake-1", String(reset && reset.model));
+
+  const prefsSaved = await S.setPrefs({ sidebarWidth: 320, aiWidth: 460, aiPanelOpen: true });
+  check("ui/setPrefs：写入成功", !!prefsSaved && !!prefsSaved.prefs, JSON.stringify(prefsSaved));
+  const prefsBack = await S.getPrefs();
+  check("ui/getPrefs：宽度能回读", !!prefsBack && prefsBack.sidebarWidth === 320 && prefsBack.aiWidth === 460,
+    JSON.stringify(prefsBack));
+  const clamped = await S.setPrefs({ aiWidth: 99999 });
+  check("ui/setPrefs：超范围宽度被钳制", !!clamped && clamped.prefs.aiWidth === 720,
+    JSON.stringify(clamped && clamped.prefs));
+
+  modelSrv.close();
+
   console.log("\n===== 通过 " + pass.length + " 项 =====");
   pass.forEach((p) => console.log("  PASS  " + p));
   if (fail.length) {

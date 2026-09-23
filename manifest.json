@@ -3,9 +3,9 @@
   "manifest_version": 1,
   "id": "com.lwai.mdnotes",
   "name": "MD 笔记",
-  "version": "0.7.1",
+  "version": "0.8.1",
   "publisher": "lwai",
-  "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。",
+  "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。内置 AI 助手（右侧常驻栏），可接入任意 OpenAI 兼容 / Anthropic / Ollama 模型对笔记做分析、润色、续写与问答。",
   "icon": "assets/plugin.svg",
   "engines": {
     "dbx": ">=0.5.68",
@@ -66,6 +66,139 @@
           "picker": {
             "kind": "directory"
           }
+        },
+        {
+          "key": "ai_enabled",
+          "label": "启用 AI 功能",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "description": "开启后工作台右侧会出现 AI 助手栏，可对笔记做分析、润色、续写与问答。关闭时下面的 AI 配置项不显示，也不会发起任何外部请求。这里的配置是初始值，之后可在工作台的 AI 助手栏里直接修改。"
+        },
+        {
+          "key": "ai_provider",
+          "label": "AI 服务提供方",
+          "type": "select",
+          "binding": "config",
+          "default": "openai",
+          "options": [
+            {
+              "label": "OpenAI 兼容（DeepSeek / 通义 / Kimi / 自建网关）",
+              "value": "openai"
+            },
+            {
+              "label": "Anthropic（Claude）",
+              "value": "anthropic"
+            },
+            {
+              "label": "Ollama（本地模型）",
+              "value": "ollama"
+            }
+          ],
+          "description": "选择接口协议。绝大多数国产模型与自建网关都兼容 OpenAI 协议。",
+          "visible_when": {
+            "field": "ai_enabled",
+            "one_of": [
+              true
+            ]
+          }
+        },
+        {
+          "key": "ai_base_url",
+          "label": "API 地址",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "placeholder": "https://api.deepseek.com/v1",
+          "description": "服务根地址（不含 /chat/completions）。Ollama 本地默认 http://127.0.0.1:11434/v1。",
+          "visible_when": {
+            "field": "ai_enabled",
+            "one_of": [
+              true
+            ]
+          }
+        },
+        {
+          "key": "ai_model",
+          "label": "模型名称",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "placeholder": "deepseek-chat",
+          "description": "按服务方文档填写，例如 deepseek-chat、gpt-4o-mini、qwen2.5:7b。",
+          "visible_when": {
+            "field": "ai_enabled",
+            "one_of": [
+              true
+            ]
+          }
+        },
+        {
+          "key": "ai_api_key",
+          "label": "API 密钥",
+          "type": "password",
+          "binding": "secret",
+          "default": "",
+          "description": "保存在 DBX 的密钥存储中，只发给插件后端，不会写进笔记目录、日志或缓存。留空表示不修改已保存的密钥。Ollama 本地模型可留空。",
+          "visible_when": {
+            "field": "ai_enabled",
+            "one_of": [
+              true
+            ]
+          }
+        },
+        {
+          "key": "ai_system_prompt",
+          "label": "自定义人设（可选）",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "description": "留空则使用内置提示词。填了会替换掉默认人设。",
+          "visible_when": {
+            "field": "ai_enabled",
+            "one_of": [
+              true
+            ]
+          }
+        },
+        {
+          "key": "ai_timeout_secs",
+          "label": "单次超时（秒）",
+          "type": "number",
+          "binding": "config",
+          "default": 60,
+          "description": "模型响应较慢时可调大。范围 5–300。",
+          "visible_when": {
+            "field": "ai_enabled",
+            "one_of": [
+              true
+            ]
+          }
+        },
+        {
+          "key": "ai_max_chars",
+          "label": "单次送入上限（字符）",
+          "type": "number",
+          "binding": "config",
+          "default": 12000,
+          "description": "超过部分会被截断（界面会提示），避免超出模型上下文。范围 500–200000。",
+          "visible_when": {
+            "field": "ai_enabled",
+            "one_of": [
+              true
+            ]
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "test-ai",
+          "label": "测试 AI 连接",
+          "description": "用当前填写的地址 / 密钥 / 模型发一次最小请求，确认能通再保存。",
+          "variant": "outline",
+          "when": "always",
+          "requires_valid_form": false,
+          "timeout_ms": 90000
         }
       ]
     },

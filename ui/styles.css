@@ -67,11 +67,37 @@ body {
 
 button, input, textarea, select { font: inherit; color: inherit; }
 
+/* 三栏布局：目录区 | 笔记区 | AI 助手区。宽度由 CSS 变量驱动（拖分隔条时改这两个变量）。
+   data-ai="off" 时 AI 栏与它的分隔条一起消失（列宽归 0，不占位）。 */
 #app {
+  --side-w: 272px;
+  --ai-w: 400px;
   display: grid;
-  grid-template-columns: 272px 1fr;
+  grid-template-columns: var(--side-w) 5px minmax(0, 1fr) 5px var(--ai-w);
   height: 100%;
 }
+#app[data-ai="off"] { grid-template-columns: var(--side-w) 5px minmax(0, 1fr) 0 0; }
+#app[data-ai="off"] #gutter-ai,
+#app[data-ai="off"] #ai-panel { display: none; }
+
+/* 拖动分隔条。必须 touch-action:none，否则触控/触控板上的指针事件会被滚动抢走。 */
+.gutter {
+  position: relative;
+  cursor: col-resize;
+  background: var(--bg-sub);
+  border-right: 1px solid var(--border);
+  touch-action: none;
+}
+.gutter::after {
+  content: "";
+  position: absolute;
+  inset: 0 1px;
+  background: transparent;
+  transition: background .12s;
+}
+.gutter:hover::after { background: var(--border); }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing .gutter::after { background: var(--accent); }
 
 /* ---------------- 侧栏 ---------------- */
 #sidebar {
@@ -79,7 +105,6 @@ button, input, textarea, select { font: inherit; color: inherit; }
   flex-direction: column;
   min-width: 0;
   background: var(--bg-sub);
-  border-right: 1px solid var(--border);
 }
 
 .side-head {
@@ -333,6 +358,13 @@ button.danger:hover { background: var(--danger-soft); }
 
 .toolbar-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .toolbar-right .sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+/* 「AI 助手」按钮：右栏开着时高亮，一眼能看出状态 */
+.toolbar-right button.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
 
 /* ---------------- 编辑 / 预览 ---------------- */
 .panes {
@@ -572,6 +604,222 @@ button.danger:hover { background: var(--danger-soft); }
   gap: 8px;
   margin-top: 16px;
 }
+
+/* ---------------- AI 助手（右侧常驻栏） ----------------
+   与弹窗版的区别：它一直在这儿，可以有历史记录，也不会挡住笔记。
+   结果区域自己滚动，输入区固定在底部（对话式布局）。 */
+.ai-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg-sub);
+  border-left: 1px solid var(--border);
+}
+
+.aip-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 10px 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.aip-brand { font-weight: 600; letter-spacing: .2px; }
+.aip-model {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--fg-subtle);
+  text-align: right;
+  padding-right: 2px;
+}
+.ai-panel .icon-btn { padding: 2px 6px; font-size: 13px; line-height: 1.4; }
+.ai-panel .icon-btn.on { background: var(--accent-soft); color: var(--accent); }
+
+/* 配置区 */
+.aip-cfg {
+  padding: 10px 12px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-elev);
+  max-height: 58vh;
+  overflow: auto;
+}
+.aip-cfg .m-label { margin-top: 8px; }
+.aip-cfg .m-text { min-height: 56px; }
+.aip-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.aip-check input { margin-top: 3px; flex: none; }
+.aip-check span { line-height: 1.45; }
+.aip-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.aip-2col > label { min-width: 0; }
+.aip-cfg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.aip-cfg-actions button { flex: 1; min-width: 92px; }
+.aip-msg {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg-subtle);
+  word-break: break-word;
+}
+.aip-msg[data-kind="ok"] { color: var(--ok); }
+.aip-msg[data-kind="warn"] { color: var(--warn); }
+.aip-msg[data-kind="err"] { color: var(--danger); }
+
+/* 范围提示 */
+.aip-scope {
+  padding: 8px 12px 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg-subtle);
+  word-break: break-word;
+}
+
+/* 任务切换 */
+.aip-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.aip-tab {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--fg-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.aip-tab:hover { background: var(--bg-hover); color: var(--fg); }
+.aip-tab.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* 对话记录 */
+.aip-log {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px 4px;
+}
+.aip-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--fg-subtle);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+.aip-entry {
+  margin-bottom: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.aip-entry-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 9px;
+  background: var(--bg-sub);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 11.5px;
+  color: var(--fg-subtle);
+}
+.aip-entry-task { font-weight: 600; color: var(--accent); flex: none; }
+.aip-entry-note {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aip-entry-meta { flex: none; }
+.aip-entry-instr {
+  padding: 6px 9px 0;
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.aip-entry-body {
+  margin: 0;
+  padding: 8px 9px;
+  max-height: 46vh;
+  overflow: auto;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.62;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.aip-entry-body.err { color: var(--danger); }
+.aip-entry-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--border-soft);
+}
+.aip-entry-actions button { font-size: 11.5px; padding: 3px 8px; }
+.aip-busy {
+  font-size: 12.5px;
+  color: var(--fg-subtle);
+  padding: 8px 2px 10px;
+}
+
+/* 底部输入区 */
+.aip-compose {
+  border-top: 1px solid var(--border);
+  padding: 8px 12px 10px;
+}
+.aip-input {
+  width: 100%;
+  min-height: 54px;
+  max-height: 26vh;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  resize: vertical;
+  outline: none;
+  font-size: 12.5px;
+}
+.aip-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.aip-compose-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+}
+.aip-status {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--fg-subtle);
+  word-break: break-word;
+}
+.aip-compose-bar button { flex: none; }
 
 /* ---------------- 右键菜单 ---------------- */
 .ctx-menu {

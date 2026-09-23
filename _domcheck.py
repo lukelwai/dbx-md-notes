@@ -57,7 +57,8 @@ print("OK：没有重复的函数声明。")
 
 # 关键元素清单（置顶诊断条已下线，不再要求 diag-* 元素）
 CRITICAL = ["main", "store-status", "store-text",
-            "tree", "editor", "title"]
+            "tree", "editor", "title",
+            "ai-panel", "aip-log", "aip-go", "gutter-side", "gutter-ai"]
 missing = [c for c in CRITICAL if c not in live_ids]
 if missing:
     print("!! index.html 缺关键元素: %s" % ", ".join(missing))

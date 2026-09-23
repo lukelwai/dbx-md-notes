@@ -108,7 +108,8 @@ if (badRefs.length) {
 }
 
 // (b) 关键 UI 节点必须在 index.html 里真实存在
-const CRITICAL = ["main", "store-status", "store-text", "tree", "editor", "title"];
+const CRITICAL = ["main", "store-status", "store-text", "tree", "editor", "title",
+  "ai-panel", "aip-log", "aip-go", "gutter-side", "gutter-ai"];
 const missingCritical = CRITICAL.filter(id => !liveIds.has(id));
 if (missingCritical.length) {
   console.error("\n[FATAL] index.html 缺少关键元素：" + missingCritical.join(", ") + "\n");
@@ -166,8 +167,32 @@ if (enableImport[1] === "true" && !(importBtnLive && importInputLive)) {
   process.exit(1);
 }
 
+// (d3) 权限：本插件刻意【不依赖】宿主内置 AI。
+//      host.ai 只在 ≥0.6.20 的宿主上存在，而 permissions 是静态的 —— 声明它会让老宿主
+//      在安装阶段直接拒绝整个包，为了一个「不返回模型回复」的入口把用户全挡在门外并不值。
+//      这里把它固化成闸门，防止日后又被顺手加回来。
+if ((mani.permissions || []).indexOf("host.ai") >= 0) {
+  console.error("\n[FATAL] manifest 声明了 host.ai：本插件只用自配第三方模型，不应依赖宿主内置 AI。");
+  console.error("        它会把最低宿主抬到 0.6.20，且旧宿主会在安装阶段直接拒绝整个包。\n");
+  process.exit(1);
+}
+// (d4) .dbx-store.json 的 permissions 必须与 manifest 一致，
+//      否则商店报 "Marketplace package permissions do not match catalog permissions"。
+try {
+  const pub = JSON.parse(fs.readFileSync(root + ".dbx-store.json", "utf8"));
+  if (JSON.stringify(pub.permissions) !== JSON.stringify(mani.permissions)) {
+    console.error("\n[FATAL] .dbx-store.json 的 permissions 与 manifest 不一致（商店会拒绝这个包）：");
+    console.error("        manifest   : " + JSON.stringify(mani.permissions));
+    console.error("        .dbx-store : " + JSON.stringify(pub.permissions) + "\n");
+    process.exit(1);
+  }
+} catch (e) {
+  console.warn("\n[WARN] 读不到 .dbx-store.json（跳过权限一致性检查）：" + e.message + "\n");
+}
+
 // (c) 前端 UI 版本号必须与 manifest 一致，避免「装的是新版、跑的是旧代码」
 const uiVer = (storeSrc.match(/var UI_VERSION = "([^"]+)"/) || [])[1];
+
 if (uiVer !== ver) {
   console.error(`\n[FATAL] ui/storage.js UI_VERSION=${uiVer} 与 manifest.version=${ver} 不一致。\n`);
   process.exit(1);

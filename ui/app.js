@@ -911,6 +911,7 @@
     renderStatus();
     renderSideFoot();
     renderDiag();
+    renderAIScope();   // AI 栏顶部要显示「当前处理哪篇 / 选中多少字」，换笔记就得跟着变
   }
 
   // ---------------- 节点操作 ----------------
@@ -1040,6 +1041,10 @@
     } else {
       item("重命名", function () { renameNode(n); });
       item("移动到…", function () { moveNodeFlow(n); });
+      item("AI 分析", function () { openAIPanel("analyze"); });
+      item("AI 润色", function () { openAIPanel("polish"); });
+      item("AI 续写", function () { openAIPanel("continue"); });
+      item("问 AI", function () { openAIPanel("ask"); });
       item("导出 .md", function () { exportNote(n); });
       item("复制正文", function () { copyText(n.content || "", "笔记正文"); });
       item("删除笔记", function () { removeNode(n); }, true);
@@ -1499,6 +1504,670 @@
     state.activeId = n1.id;
   }
 
+  // ---------------- AI 助手（右侧常驻栏） ----------------
+  //
+  // 模型调用全部发生在侧车（前端在沙箱里既没有网络，也拿不到密钥）。
+  // 这里只负责：取目标文本 → 展示结果（带会话记录）→ 让用户**显式**选择
+  // 「插入到光标 / 替换选中 / 追加到末尾 / 复制」。
+  // 任何会覆盖已有正文的操作（替换选中、在有选区时插入）都必须先过确认框 ——
+  // 与全插件的「不静默覆盖」原则一致。
+  //
+  // 为什么不做成弹窗：弹窗会遮住笔记、关掉就丢历史，而 AI 结果常常要边看边改。
+  var AI_TASKS = [
+    { id: "analyze", label: "分析", hint: "总结要点、待办与矛盾之处", needsInput: false, go: "开始分析" },
+    { id: "polish", label: "润色", hint: "保持原意与 Markdown 结构，改善表达", needsInput: true, go: "开始润色" },
+    { id: "continue", label: "续写", hint: "在末尾自然地续写下去", needsInput: true, go: "开始续写" },
+    { id: "ask", label: "提问", hint: "针对这篇笔记提问", needsInput: true, go: "提问" }
+  ];
+
+  // 缺配置时给中文名，用户才知道要去填哪一项
+  var AI_MISSING_LABEL = {
+    enabled: "启用 AI 功能",
+    baseUrl: "API 地址",
+    model: "模型名称",
+    apiKey: "API 密钥"
+  };
+
+  var AI_MAX_ENTRIES = 20;   // 只留最近若干条，避免长时间使用后内存无限增长
+
+  var aiState = {
+    open: false,
+    task: "analyze",
+    cfg: null,
+    busy: false,
+    entries: [],
+    cfgPristine: true,   // 配置区是否还没被用户改过（没改过就允许用服务端值覆盖表单）
+    layoutReady: false
+  };
+
+  function aiTaskDef(id) {
+    for (var i = 0; i < AI_TASKS.length; i++) {
+      if (AI_TASKS[i].id === id) { return AI_TASKS[i]; }
+    }
+    return AI_TASKS[0];
+  }
+
+  function aiErrText(e) {
+    return (e && e.message) ? e.message : String(e || "未知错误");
+  }
+
+  /** 用户当前想处理的范围：编辑器里选中的文本优先，否则整篇笔记 */
+  function aiTarget() {
+    var n = activeNote();
+    if (!n) { return null; }
+    var ed = $("editor");
+    var start = 0, end = 0, sel = "";
+    if (ed && ed.selectionStart != null && ed.selectionEnd != null && ed.selectionEnd > ed.selectionStart) {
+      start = ed.selectionStart;
+      end = ed.selectionEnd;
+      sel = String(ed.value || "").slice(start, end);
+    }
+    return {
+      note: n,
+      text: sel || String(n.content || ""),
+      hasSelection: !!sel,
+      start: start,
+      end: end
+    };
+  }
+
+  function aiCharCount(s) { return String(s == null ? "" : s).length; }
+
+  function renderAIScope() {
+    var el = $("aip-scope");
+    if (!el) { return; }
+    if (!aiState.open) { return; }
+    var tgt = aiTarget();
+    if (!tgt) {
+      el.textContent = "未选择笔记：请先在左侧点一条笔记。";
+      return;
+    }
+    var n = aiCharCount(tgt.text);
+    var cap = (aiState.cfg && aiState.cfg.maxChars) ? aiState.cfg.maxChars : 12000;
+    var scope = tgt.hasSelection ? ("选中 " + n + " 字") : ("整篇 " + n + " 字");
+    var line = "对象：《" + String(tgt.note.name || "") + "》· " + scope;
+    if (!tgt.hasSelection && n === 0) { line += "（这篇还没有内容）"; }
+    if (n > cap) { line += "· 超过单次上限 " + cap + "，会自动截断"; }
+    el.textContent = line;
+  }
+
+  function renderAITabs() {
+    var box = $("aip-tabs");
+    if (!box) { return; }
+    while (box.firstChild) { box.removeChild(box.firstChild); }
+    AI_TASKS.forEach(function (def) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "aip-tab" + (aiState.task === def.id ? " active" : "");
+      b.textContent = def.label;
+      b.title = def.hint;
+      b.setAttribute("data-task", def.id);
+      b.onclick = function () { setAITask(def.id); };
+      box.appendChild(b);
+    });
+    var go = $("aip-go");
+    if (go) { go.textContent = aiTaskDef(aiState.task).go; }
+    var input = $("aip-input");
+    if (input) {
+      input.placeholder = (aiState.task === "ask")
+        ? "写下你的问题（必填）"
+        : "（可选）额外要求，例如：更简洁 / 保留术语";
+    }
+  }
+
+  function setAITask(id) {
+    aiState.task = aiTaskDef(id).id;
+    renderAITabs();
+    renderAIScope();
+  }
+
+  function renderAIModel() {
+    var el = $("aip-model");
+    if (!el) { return; }
+    var c = aiState.cfg;
+    if (!c) { el.textContent = "配置读取中…"; return; }
+    if (!c.ready) {
+      el.textContent = "未配置";
+      return;
+    }
+    el.textContent = (c.provider || "") + " · " + (c.model || "");
+    el.title = el.textContent + (c.hasKey ? "\n密钥来源：" + (c.keyFrom === "local" ? "本机面板" : "连接配置") : "\n无密钥（本地模型）");
+  }
+
+  function aiConfigMsg(text, kind) {
+    var el = $("aip-cfg-msg");
+    if (!el) { return; }
+    el.textContent = text || "";
+    if (kind) { el.setAttribute("data-kind", kind); } else { el.removeAttribute("data-kind"); }
+  }
+
+  /** 把服务端配置填回表单（仅在用户还没改过表单时覆盖，避免把正在输入的内容冲掉） */
+  function syncAIConfigForm(cfg) {
+    if (!cfg || !aiState.cfgPristine) { return; }
+    var set = function (id, v) { var e = $(id); if (e) { e.value = v; } };
+    var chk = function (id, v) { var e = $(id); if (e) { e.checked = !!v; } };
+    chk("aip-enabled", cfg.enabled);
+    set("aip-provider", cfg.provider || "openai");
+    set("aip-baseurl", cfg.baseUrl || "");
+    set("aip-modelinput", cfg.model || "");
+    set("aip-sysprompt", cfg.systemPrompt || "");
+    set("aip-timeout", cfg.timeoutSecs || 60);
+    set("aip-maxchars", cfg.maxChars || 12000);
+    chk("aip-remember", cfg.rememberKey);
+    set("aip-key", "");   // 密钥从不回传，永远是空的（留空 = 不改）
+  }
+
+  function setAIReady(cfg) {
+    var go = $("aip-go");
+    if (!go) { return; }
+    go.disabled = aiState.busy || !(cfg && cfg.ready);
+  }
+
+  function aiReadyText(cfg) {
+    if (!cfg) { return "读取 AI 配置失败（侧车未响应）"; }
+    var tgt = aiTarget();
+    var tgtText = tgt && tgt.hasSelection ? "选中内容" : "整篇笔记";
+    if (!cfg.ready) {
+      var miss = (cfg.missing || []).map(function (k) { return AI_MISSING_LABEL[k] || k; });
+      return "还缺：" + miss.join("、") + " —— 点右上角 ⚙ 填写";
+    }
+    var bits = ["本次会发送" + tgtText];
+    if (cfg.truncatedNote) { bits.push(cfg.truncatedNote); }
+    return bits.join(" · ");
+  }
+
+  /** 拉一次配置：刷新表单、标题、状态与按钮可用性 */
+  function refreshAIConfig(quiet) {
+    return S.aiConfig().then(function (cfg) {
+      aiState.cfg = cfg;
+      syncAIConfigForm(cfg);
+      renderAIModel();
+      setAIReady(cfg);
+      var st = $("aip-status");
+      if (st) { st.textContent = aiReadyText(cfg); }
+      if (!quiet && cfg && !cfg.ready && aiState.cfgPristine) {
+        // 首次打开就发现没配对：直接把配置区展开，省去"为什么不能点"的困惑
+        setAICfgOpen(true);
+      }
+      renderAIScope();
+      return cfg;
+    });
+  }
+
+  function setAICfgOpen(open) {
+    var box = $("aip-cfg");
+    var btn = $("aip-cfg-toggle");
+    if (box) { box.hidden = !open; }
+    if (btn) { if (open) { btn.classList.add("on"); } else { btn.classList.remove("on"); } }
+    if (open) { aiState.cfgPristine = true; syncAIConfigForm(aiState.cfg); }
+  }
+
+  function toggleAICfg() {
+    var box = $("aip-cfg");
+    setAICfgOpen(!!(box && box.hidden));
+  }
+
+  function collectAIConfigForm() {
+    var val = function (id) { var e = $(id); return e ? String(e.value || "") : ""; };
+    var on = function (id) { var e = $(id); return !!(e && e.checked); };
+    var cfg = {
+      enabled: on("aip-enabled"),
+      provider: val("aip-provider") || "openai",
+      baseUrl: val("aip-baseurl").trim(),
+      model: val("aip-modelinput").trim(),
+      systemPrompt: val("aip-sysprompt"),
+      rememberKey: on("aip-remember")
+    };
+    var t = parseInt(val("aip-timeout"), 10);
+    if (t > 0) { cfg.timeoutSecs = t; }
+    var m = parseInt(val("aip-maxchars"), 10);
+    if (m > 0) { cfg.maxChars = m; }
+    var key = val("aip-key");
+    if (key.trim()) { cfg.apiKey = key.trim(); }   // 留空 = 不修改
+    return cfg;
+  }
+
+  /** persist=true 落盘（长期有效）；false 只用于「测试连接」，不写入配置文件 */
+  function submitAIConfig(persist) {
+    aiConfigMsg(persist ? "正在保存…" : "正在应用（不保存）…", "");
+    return S.aiSetConfig(collectAIConfigForm(), persist).then(function (view) {
+      aiState.cfg = view;
+      aiState.cfgPristine = true;
+      syncAIConfigForm(view);
+      renderAIModel();
+      setAIReady(view);
+      var st = $("aip-status");
+      if (st) { st.textContent = aiReadyText(view); }
+      renderAIScope();
+      if (persist) {
+        var where = view.keyOnDisk
+          ? "配置已保存（密钥已存到本机插件数据目录）"
+          : (view.hasKey ? "配置已保存（密钥仅在本次会话有效：未勾选「在本机记住密钥」）" : "配置已保存");
+        aiConfigMsg(where, "ok");
+        toast("AI 配置已保存");
+      } else {
+        aiConfigMsg("参数已应用但未保存：点「保存」才会长期有效", "");
+      }
+      return view;
+    }).catch(function (e) {
+      aiConfigMsg("保存失败：" + aiErrText(e), "err");
+    });
+  }
+
+  function testAIConfig() {
+    var btn = $("aip-test");
+    if (btn) { btn.disabled = true; }
+    aiConfigMsg("正在测试连接（最长约一分钟）…", "");
+    S.aiTest(collectAIConfigForm()).then(function (r) {
+      if (r && r.success) {
+        aiConfigMsg(r.message || "连接成功", "ok");
+      } else {
+        aiConfigMsg((r && r.message) || "测试失败（没有返回原因）", "err");
+      }
+    }).catch(function (e) {
+      aiConfigMsg("测试失败：" + aiErrText(e), "err");
+    }).then(function () {
+      if (btn) { btn.disabled = false; }
+    });
+  }
+
+  function clearLocalAIConfig() {
+    confirmListModal("清除本机保存的 AI 配置？", [
+      "会删除本机插件数据目录里的 AI 配置文件（含可能保存的密钥），",
+      "之后以「MD 笔记」连接里的 AI 配置为准。",
+      "笔记、连接与存储目录都不受影响。"
+    ], "清除").then(function (ok) {
+      if (!ok) { return; }
+      S.aiResetConfig().then(function (view) {
+        aiState.cfg = view;
+        aiState.cfgPristine = true;
+        syncAIConfigForm(view);
+        renderAIModel();
+        setAIReady(view);
+        renderAIScope();
+        aiConfigMsg("已清除本机配置，现在以连接配置为准", "ok");
+        toast("已清除本机 AI 配置");
+      }).catch(function (e) {
+        aiConfigMsg("清除失败：" + aiErrText(e), "err");
+      });
+    });
+  }
+
+  /* ---------------- 会话记录（每条结果都有四个操作） ---------------- */
+
+  function aiHintEl() {
+    var d = document.createElement("div");
+    d.className = "aip-hint";
+    d.appendChild(document.createTextNode("选择一种任务后点下方按钮。"));
+    d.appendChild(document.createElement("br"));
+    d.appendChild(document.createTextNode("有选中文本时只处理选中部分，否则处理整篇笔记。"));
+    d.appendChild(document.createElement("br"));
+    d.appendChild(document.createTextNode("结果不会自动写回 —— 由你选择「插入到光标 / 替换选中 / 追加到末尾 / 复制」。"));
+    return d;
+  }
+
+  var AI_OPS = [
+    { op: "insert", text: "插入到光标" },
+    { op: "replace", text: "替换选中" },
+    { op: "append", text: "追加到末尾" },
+    { op: "copy", text: "复制" }
+  ];
+
+  function aiEntryEl(en) {
+    var box = document.createElement("div");
+    box.className = "aip-entry";
+
+    var head = document.createElement("div");
+    head.className = "aip-entry-head";
+    var task = document.createElement("span");
+    task.className = "aip-entry-task";
+    task.textContent = en.taskLabel + (en.hasSelection ? "（选中）" : "");
+    head.appendChild(task);
+    var note = document.createElement("span");
+    note.className = "aip-entry-note";
+    note.textContent = "《" + en.noteName + "》";
+    head.appendChild(note);
+    var meta = document.createElement("span");
+    meta.className = "aip-entry-meta";
+    meta.textContent = en.meta || "";
+    head.appendChild(meta);
+    box.appendChild(head);
+
+    if (en.instruction) {
+      var ins = document.createElement("div");
+      ins.className = "aip-entry-instr";
+      ins.textContent = (en.task === "ask" ? "问：" : "要求：") + en.instruction;
+      box.appendChild(ins);
+    }
+
+    if (en.pending) {
+      var busy = document.createElement("div");
+      busy.className = "aip-busy";
+      busy.textContent = "生成中…（通常几秒到几十秒，慢模型请耐心等待）";
+      box.appendChild(busy);
+      return box;
+    }
+
+    var body = document.createElement("pre");
+    body.className = "aip-entry-body" + (en.error ? " err" : "");
+    body.textContent = en.error ? ("失败：" + en.error) : (en.result || "（空结果）");
+    box.appendChild(body);
+
+    if (!en.error && en.result) {
+      var acts = document.createElement("div");
+      acts.className = "aip-entry-actions";
+      AI_OPS.forEach(function (def) {
+        var b = document.createElement("button");
+        b.type = "button";
+        b.textContent = def.text;
+        b.onclick = function () { applyAIResult(en, def.op); };
+        acts.appendChild(b);
+      });
+      box.appendChild(acts);
+    }
+    return box;
+  }
+
+  function renderAILog() {
+    var log = $("aip-log");
+    if (!log) { return; }
+    while (log.firstChild) { log.removeChild(log.firstChild); }
+    if (!aiState.entries.length) {
+      log.appendChild(aiHintEl());
+      return;
+    }
+    aiState.entries.forEach(function (en) { log.appendChild(aiEntryEl(en)); });
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function clearAILog() {
+    if (!aiState.entries.length) { toast("还没有对话记录"); return; }
+    aiState.entries = [];
+    renderAILog();
+    toast("已清空对话记录");
+  }
+
+  /* ---------------- 执行任务 ---------------- */
+
+  function runAITask() {
+    if (aiState.busy) { return; }
+    var tgt = aiTarget();
+    if (!tgt) { toast("请先在左侧选择一条笔记", "warn"); return; }
+    if (!String(tgt.text).trim()) { toast("这条笔记还没有内容", "warn"); return; }
+    var def = aiTaskDef(aiState.task);
+    var input = $("aip-input");
+    var extra = input ? String(input.value || "").trim() : "";
+    if (def.id === "ask" && !extra) { toast("请先在下方写下你的问题", "warn"); return; }
+
+    var entry = {
+      task: def.id,
+      taskLabel: def.label,
+      noteId: tgt.note.id,
+      noteName: String(tgt.note.name || ""),
+      instruction: extra,
+      hasSelection: tgt.hasSelection,
+      scopeChars: aiCharCount(tgt.text),
+      result: "",
+      error: "",
+      meta: "",
+      pending: true
+    };
+    aiState.busy = true;
+    aiState.entries.push(entry);
+    if (aiState.entries.length > AI_MAX_ENTRIES) { aiState.entries.shift(); }
+    renderAILog();
+    setAIReady(aiState.cfg);
+    var go = $("aip-go");
+    if (go) { go.textContent = "生成中…"; }
+
+    var started = Date.now();
+    S.aiChat(def.id, tgt.text, extra).then(function (r) {
+      entry.pending = false;
+      entry.result = String((r && r.content) || "");
+      if (!entry.result) { entry.error = "模型返回了空内容"; }
+      var bits = [];
+      if (r && r.model) { bits.push(r.model); }
+      if (r && r.truncated) { bits.push("已截断至 " + r.sentChars + " 字"); }
+      bits.push(((r && r.latencyMs != null) ? r.latencyMs : (Date.now() - started)) + " ms");
+      entry.meta = bits.join(" · ");
+    }).catch(function (e) {
+      entry.pending = false;
+      entry.error = aiErrText(e);
+    }).then(function () {
+      aiState.busy = false;
+      renderAILog();
+      setAIReady(aiState.cfg);
+      var g = $("aip-go");
+      if (g) { g.textContent = aiTaskDef(aiState.task).go; }
+      var st = $("aip-status");
+      if (st) { st.textContent = aiReadyText(aiState.cfg); }
+    });
+  }
+
+  /* ---------------- 结果回写（四个操作） ---------------- */
+
+  function currentSelection(ed) {
+    if (!ed || ed.selectionStart == null || ed.selectionEnd == null) { return null; }
+    if (ed.selectionEnd <= ed.selectionStart) { return null; }
+    return { start: ed.selectionStart, end: ed.selectionEnd };
+  }
+
+  function applyAIResult(en, op) {
+    var ed = $("editor");
+    var n = activeNote();
+    if (!ed || !n) { toast("请先在左侧选择一条笔记", "warn"); return; }
+    if (n.id !== en.noteId) {
+      // 结果来自另一篇笔记：写进去几乎一定是误操作，先问一句
+      confirmListModal("这段结果来自另一篇笔记", [
+        "结果生成自：《" + en.noteName + "》",
+        "当前编辑的是：《" + String(n.name || "") + "》",
+        "",
+        "继续会把结果写入《" + String(n.name || "") + "》。"
+      ], "继续写入").then(function (ok) {
+        if (ok) { doApplyAIResult(en, op, ed, n); }
+      });
+      return;
+    }
+    doApplyAIResult(en, op, ed, n);
+  }
+
+  function doApplyAIResult(en, op, ed, n) {
+    var result = String(en.result || "");
+    if (!result) { toast("这条结果没有内容", "warn"); return; }
+    if (op === "copy") { copyText(result, "AI 结果"); return; }
+
+    var v = String(ed.value || "");
+    var sel = currentSelection(ed);
+
+    if (op === "append") {
+      var tail = (v.length && !/\n$/.test(v)) ? "\n\n" : "";
+      ed.value = v + tail + result;
+      ed.selectionStart = ed.selectionEnd = ed.value.length;
+      commitEditor(n, ed);
+      toast("已追加到末尾");
+      return;
+    }
+
+    // 换行/覆盖都会改动已有正文，一律先确认（选中时的「插入」其实也是替换）
+    if (op === "replace" || sel) {
+      if (!sel) { toast("当前没有选中内容，无法替换", "warn"); return; }
+      var oldText = v.slice(sel.start, sel.end);
+      var oldLines = oldText.split(/\r?\n/).length;
+      var newLines = result.split(/\r?\n/).length;
+      confirmListModal("确认替换选中的内容？", [
+        "范围：" + sel.start + "–" + sel.end + "（" + oldText.length + " 字）",
+        "行数：" + oldLines + " 行 → " + newLines + " 行",
+        "",
+        "替换前的内容：",
+        oldText.slice(0, 300) + (oldText.length > 300 ? "…" : "")
+      ], "替换").then(function (ok) {
+        if (!ok) { return; }
+        var cur = String(ed.value || "");
+        // 确认框期间用户可能又改了正文：范围越界就放弃，绝不写坏
+        if (sel.end > cur.length) { toast("正文已变化，请重新选择后再替换", "warn"); return; }
+        ed.value = cur.slice(0, sel.start) + result + cur.slice(sel.end);
+        ed.selectionStart = ed.selectionEnd = sel.start + result.length;
+        commitEditor(n, ed);
+        toast("已替换选中内容");
+      });
+      return;
+    }
+
+    // 无选区 → 纯插入，不动任何已有正文
+    var at = (ed.selectionStart == null) ? v.length : ed.selectionStart;
+    ed.value = v.slice(0, at) + result + v.slice(at);
+    ed.selectionStart = ed.selectionEnd = at + result.length;
+    commitEditor(n, ed);
+    toast("已插入到光标处");
+  }
+
+  function commitEditor(n, ed) {
+    n.content = ed.value;
+    n.updatedAt = nowISO();
+    ed.focus();
+    persist(false);
+    renderPreview();
+    updateCounter();
+    renderTree();
+  }
+
+  /* ---------------- 面板开关 ---------------- */
+
+  function setAIPanelOpen(open) {
+    aiState.open = !!open;
+    var app = $("app");
+    var btn = $("btn-ai");
+    var panel = $("ai-panel");
+    if (app) { app.setAttribute("data-ai", aiState.open ? "on" : "off"); }
+    if (panel) { panel.hidden = !aiState.open; }
+    if (btn) { if (aiState.open) { btn.classList.add("on"); } else { btn.classList.remove("on"); } }
+    if (aiState.open) {
+      renderAITabs();
+      renderAIScope();
+      refreshAIConfig();
+    }
+    S.setPrefs({ aiPanelOpen: aiState.open });
+  }
+
+  /** 打开（已打开则切任务）；task 省略时沿用上次的任务 */
+  function openAIPanel(task) {
+    if (task) { aiState.task = aiTaskDef(task).id; }
+    if (!aiState.open) {
+      setAIPanelOpen(true);
+      return;
+    }
+    renderAITabs();
+    renderAIScope();
+    if (task) { toast("已切到「" + aiTaskDef(task).label + "」任务"); }
+  }
+
+  function toggleAIPanel() { setAIPanelOpen(!aiState.open); }
+
+  /* ---------------- 三栏宽度（拖动分隔条） ----------------
+   * 宽度存在侧车（<dataDir>/prefs.json）：沙箱里 window.origin 是 "null"（opaque origin），
+   * 访问 localStorage 会直接抛 SecurityError；也不该塞进笔记数据里 —— 这是每台机器的界面偏好。
+   */
+  var SIDE_MIN = 180, SIDE_MAX = 720, SIDE_DEFAULT = 272;
+  var AI_MIN = 280, AI_MAX = 720, AI_DEFAULT = 400;
+  var layout = { side: SIDE_DEFAULT, ai: AI_DEFAULT };
+
+  function clampWidth(v, min, max) {
+    var n = Number(v);
+    if (!isFinite(n)) { return min; }
+    if (n < min) { return min; }
+    if (n > max) { return max; }
+    return Math.round(n);
+  }
+
+  function applyLayout() {
+    var app = $("app");
+    if (!app) { return; }
+    app.style.setProperty("--side-w", layout.side + "px");
+    app.style.setProperty("--ai-w", layout.ai + "px");
+  }
+
+  function saveLayout() {
+    S.setPrefs({ sidebarWidth: layout.side, aiWidth: layout.ai });
+  }
+
+  function loadLayout() {
+    return S.getPrefs().then(function (p) {
+      if (p && typeof p.sidebarWidth === "number") { layout.side = clampWidth(p.sidebarWidth, SIDE_MIN, SIDE_MAX); }
+      if (p && typeof p.aiWidth === "number") { layout.ai = clampWidth(p.aiWidth, AI_MIN, AI_MAX); }
+      applyLayout();
+      aiState.layoutReady = true;
+      if (p && p.aiPanelOpen === true) { setAIPanelOpen(true); }
+      return p;
+    });
+  }
+
+  /**
+   * 把一条分隔条接上指针拖拽。
+   * 用指针事件 + setPointerCapture 自实现：沙箱里 HTML5 拖拽（dragstart/drop）会出禁止光标，
+   * 而且它在 iframe 里也拿不到跨元素坐标。
+   */
+  function bindGutter(el, opts) {
+    if (!el) { return; }
+    var dragging = false;
+    var startX = 0;
+    var startW = 0;
+
+    function move(e) {
+      if (!dragging) { return; }
+      var dx = e.clientX - startX;
+      var next = startW + (opts.invert ? -dx : dx);
+      layout[opts.key] = clampWidth(next, opts.min, opts.max);
+      applyLayout();
+    }
+    function stop(e) {
+      if (!dragging) { return; }
+      dragging = false;
+      try { el.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      var b = document.body;
+      if (b && b.classList) { b.classList.remove("resizing"); }
+      saveLayout();
+    }
+
+    el.addEventListener("pointerdown", function (e) {
+      if (e.button != null && e.button !== 0) { return; }
+      e.preventDefault();
+      dragging = true;
+      startX = e.clientX;
+      startW = layout[opts.key];
+      try { el.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      var b = document.body;
+      if (b && b.classList) { b.classList.add("resizing"); }
+    });
+    // move / up 挂在 document 上，而不是分隔条自己：
+    // 指针一旦移出分隔条（拖快一点就会），挂在元素上就收不到 pointermove，
+    // 表现成「拖一半断掉」；setPointerCapture 在部分环境（如测试用的 jsdom）并不存在。
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", stop);
+    document.addEventListener("pointercancel", stop);
+    // 双击复位到默认宽度：拖歪了不用一点点挪回来
+    el.addEventListener("dblclick", function () {
+      layout[opts.key] = opts.def;
+      applyLayout();
+      saveLayout();
+    });
+  }
+
+  function initGutters() {
+    bindGutter($("gutter-side"), { key: "side", min: SIDE_MIN, max: SIDE_MAX, def: SIDE_DEFAULT, invert: false });
+    bindGutter($("gutter-ai"), { key: "ai", min: AI_MIN, max: AI_MAX, def: AI_DEFAULT, invert: true });
+    applyLayout();
+  }
+
+  /** 启动早期：立刻把分隔条接上（纯 DOM，不依赖侧车） */
+  function initChrome() {
+    initGutters();
+  }
+
+  /** 存储就绪后：读回上次的宽度与面板开关（要发 RPC，所以不能更早） */
+  function restoreChromePrefs() {
+    return loadLayout().catch(function () { /* 偏好读不到不影响主流程 */ });
+  }
+
   // ---------------- 事件绑定 ----------------
   function bindEvents() {
     click("btn-new-note", function () { createNote("未命名笔记", targetFolderId(), ""); });
@@ -1511,6 +2180,18 @@
 
     click("btn-table-note", function () { openTableModal(null); });
     click("btn-insert-sql", insertSqlBlock);
+    // 工具栏的「AI 助手」是开/关（常驻右栏），不是弹窗；右键菜单则会带上具体任务
+    click("btn-ai", toggleAIPanel);
+    click("aip-close", function () { setAIPanelOpen(false); });
+    click("aip-cfg-toggle", toggleAICfg);
+    click("aip-clear-log", clearAILog);
+    click("aip-go", runAITask);
+    click("aip-test", testAIConfig);
+    click("aip-save", function () { submitAIConfig(true); });
+    click("aip-clear", clearLocalAIConfig);
+    // 用户一改表单就不再让服务端值覆盖它（否则「保存失败 → 重填」时会白填一遍）
+    on("aip-cfg", "oninput", function () { aiState.cfgPristine = false; });
+    on("aip-cfg", "onchange", function () { aiState.cfgPristine = false; });
     // 注意：index.html 里 #btn-copy-sql 目前是注释状态，这里必须用安全绑定（optional=true），
     // 否则整个 bindEvents 会在此处中断（2026-09-21 实际事故：所有按钮点不动 + 笔记从不落盘）。
     click("btn-copy-sql", copySqlToDbx, true);
@@ -1627,6 +2308,17 @@
         createNote("未命名笔记", targetFolderId(), "");
         return;
       }
+      if (mod && (e.key === "i" || e.key === "I")) {
+        e.preventDefault();
+        toggleAIPanel();
+        return;
+      }
+      if (mod && e.key === "Enter" && aiState.open) {
+        // 在 AI 栏的输入框里按 Ctrl/Cmd+Enter 直接执行当前任务
+        e.preventDefault();
+        runAITask();
+        return;
+      }
       if (e.key === "/" && !typing) {
         e.preventDefault();
         search.focus();
@@ -1675,6 +2367,8 @@
     var phase = "绑定事件";
     try {
       bindEvents();
+      phase = "初始化三栏布局";
+      initChrome();
       phase = "应用主题";
       applyTheme();
       phase = "读取已配置目录";
@@ -1739,6 +2433,8 @@
       handleHostContext();
       render();
       renderDiag(S.status());
+      // 宽度与「上次是否开着 AI 栏」存在侧车（插件数据目录），这里读回来
+      restoreChromePrefs();
       // 启动时【绝不】保存整份快照。
       //
       // 以前这里无条件 persist(false)"写一次验证可写"，代价是把本实例的旧快照推成权威状态：

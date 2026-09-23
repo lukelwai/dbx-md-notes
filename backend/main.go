@@ -37,7 +37,7 @@ import (
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
 	pluginID      = "com.lwai.mdnotes"
-	pluginVersion = "0.7.1" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginVersion = "0.8.1" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -93,6 +93,11 @@ func (plugin *plugin) Handle(
 			return nil, pluginError
 		}
 		plugin.mutex.Lock()
+		if plugin.connections == nil {
+			// 防御：main() 会初始化，但任何以 &plugin{} 构造的调用方（测试、将来的复用）
+			// 直接写 nil map 会 panic 并带走整个侧车进程。
+			plugin.connections = map[string]struct{}{}
+		}
 		plugin.connections[connectionID] = struct{}{}
 		plugin.mutex.Unlock()
 		// absorbParams（Handle 入口已调用）会递归扫描 storage_dir；这里再补一刀，
@@ -100,6 +105,10 @@ func (plugin *plugin) Handle(
 		if d := connDirFromValues(values); d != "" {
 			setDir(d)
 		}
+		// AI 配置同样只从连接参数里取（含补齐的 connection_secrets）。
+		// 先清掉上一个连接留下的连接层：本机层（面板保存）是用户在本机的选择，保留。
+		resetAIConn()
+		absorbAIConfig(values)
 		_ = os.MkdirAll(notesDir(), 0o755)
 		_ = os.MkdirAll(metaDir(), 0o755)
 		sidecarTrace(fmt.Sprintf("connection/connect id=%s configured=%v dir=%s",
@@ -120,6 +129,8 @@ func (plugin *plugin) Handle(
 		plugin.mutex.Lock()
 		delete(plugin.connections, connectionID)
 		plugin.mutex.Unlock()
+		// 断开连接即清空内存里的 AI 密钥，避免上一个连接的凭据被下一个连接复用。
+		resetAIConfig()
 		return map[string]any{"success": true}, nil
 
 	case "notes/ping":
@@ -224,6 +235,54 @@ func (plugin *plugin) Handle(
 			return nil, badParams("invalid params: %v", e)
 		}
 		return restoreNotes(p.DataBase64, p.DryRun)
+
+	case "ai/config":
+		return aiConfigView(), nil
+
+	case "ai/setConfig":
+		return aiSetConfigHandler(params)
+
+	case "ai/resetConfig":
+		return aiResetConfigHandler()
+
+	case "ai/test":
+		// 参数可带一组"未保存的配置"用于试连（留空的字段沿用当前生效值）
+		return aiTestHandler(params)
+
+	case "ai/chat":
+		return aiChatHandler(params)
+
+	case "ui/getPrefs":
+		return map[string]any{"prefs": loadPrefs()}, nil
+
+	case "ui/setPrefs":
+		return setPrefsHandler(params)
+
+	case "connection/action":
+		// 连接表单里的自定义动作（如「测试 AI 连接」）。参数同样带完整的 connection
+		// （含补齐的 connection_secrets），所以先吸收配置再执行 —— 用户不必先保存就能测。
+		var p struct {
+			Action     map[string]any `json:"action"`
+			Values     map[string]any `json:"values"`
+			Connection map[string]any `json:"connection"`
+			Provider   map[string]any `json:"provider"`
+			Runtime    map[string]any `json:"runtime"`
+		}
+		_ = json.Unmarshal(params, &p)
+		absorbAIConfig(map[string]any{
+			"action": p.Action, "values": p.Values,
+			"connection": p.Connection, "provider": p.Provider, "runtime": p.Runtime,
+		})
+		id := ""
+		if p.Action != nil {
+			id, _ = p.Action["id"].(string)
+		}
+		switch id {
+		case "test-ai":
+			return aiTest()
+		default:
+			return nil, badParams("未知的连接动作：%s", id)
+		}
 
 	case "filesystem/list":
 		return callFs(fsList, params)
@@ -407,6 +466,110 @@ func dirConfigured() bool {
 	d := currentDir
 	dirMu.Unlock()
 	return strings.TrimSpace(d) != ""
+}
+
+/* ---------------- UI 偏好（<dataDir>/prefs.json） ----------------
+ *
+ * 放这里而不是 localStorage：沙箱里 window.origin 是 "null"（opaque origin），
+ * 访问 localStorage 会直接抛 SecurityError。
+ * 放这里而不是笔记存储目录 / meta.json：面板宽度是"这台机器上的界面偏好"，
+ * 不是笔记数据 —— 不该跟着笔记目录走，更不该让它在多实例间互相覆盖。
+ */
+var prefKeys = map[string]bool{"sidebarWidth": true, "aiWidth": true, "aiPanelOpen": true}
+
+func prefsPath() string { return filepath.Join(dataDir(), "prefs.json") }
+
+func clampPrefWidth(v int) int {
+	if v < 180 {
+		return 180
+	}
+	if v > 720 {
+		return 720
+	}
+	return v
+}
+
+// sanitizePrefs 只保留白名单键，并把数值钳到合理范围（坏值不该把界面卡死）。
+//
+// 注意：这个函数会被调用两次（读盘后一次、合并写入前一次），第二次拿到的宽度已经是
+// int 而不是 JSON 解出来的 float64 —— 所以数值必须两种类型都认。只认 float64 的话，
+// 第二次会把这些键当"坏值"丢掉（静默丢配置，实测踩过）。
+func sanitizePrefs(in map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range in {
+		if !prefKeys[k] {
+			continue
+		}
+		switch k {
+		case "sidebarWidth", "aiWidth":
+			n, ok := prefInt(v)
+			if !ok {
+				continue
+			}
+			out[k] = clampPrefWidth(n)
+		case "aiPanelOpen":
+			b, ok := v.(bool)
+			if !ok {
+				continue
+			}
+			out[k] = b
+		}
+	}
+	return out
+}
+
+func prefInt(v any) (int, bool) {
+	switch t := v.(type) {
+	case float64:
+		return int(t), true
+	case int:
+		return t, true
+	case json.Number:
+		if n, err := t.Int64(); err == nil {
+			return int(n), true
+		}
+	}
+	return 0, false
+}
+
+func loadPrefs() map[string]any {
+	out := map[string]any{}
+	b, err := os.ReadFile(prefsPath())
+	if err != nil {
+		return out
+	}
+	var m map[string]any
+	if json.Unmarshal(b, &m) != nil {
+		return out
+	}
+	return sanitizePrefs(m)
+}
+
+func setPrefsHandler(raw json.RawMessage) (any, *dbxpluginsdk.PluginError) {
+	var p struct {
+		Prefs map[string]any `json:"prefs"`
+	}
+	if e := json.Unmarshal(raw, &p); e != nil {
+		return nil, badParams("invalid params: %v", e)
+	}
+	cur := loadPrefs()
+	for k, v := range p.Prefs {
+		if prefKeys[k] {
+			cur[k] = v
+		}
+	}
+	cur = sanitizePrefs(cur) // 归一化后再写，避免把前端传来的坏值落盘
+	if err := os.MkdirAll(dataDir(), 0o755); err != nil {
+		return nil, failed(-32012, fmt.Errorf("无法写入界面偏好：%v", err))
+	}
+	b, err := json.MarshalIndent(cur, "", "  ")
+	if err != nil {
+		return nil, failed(-32012, fmt.Errorf("无法写入界面偏好：%v", err))
+	}
+	if err := writeAtomic(prefsPath(), append(b, '\n')); err != nil {
+		return nil, failed(-32012, fmt.Errorf("无法写入界面偏好：%v", err))
+	}
+	return map[string]any{"prefs": cur}, nil
 }
 
 // connDirFromValues 从 connection/connect 的参数里尽可能稳健地取出 storage_dir。
@@ -1821,6 +1984,7 @@ func resolveMetadata() dbxpluginsdk.Metadata {
 
 func main() {
 	loadConfig()
+	loadAIConfigFromDisk()
 	_ = os.MkdirAll(dataDir(), 0o755)
 	cwd, _ := os.Getwd()
 	sidecarTrace(fmt.Sprintf("start pid=%d dataDir=%s configured=%v dir=%s cwd=%s",

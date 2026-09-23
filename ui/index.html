@@ -7,7 +7,8 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body class="light">
-  <div id="app">
+  <!-- 三栏：目录区 | 笔记区 | AI 助手区。两条 .gutter 是可拖动的分隔条。 -->
+  <div id="app" data-ai="off">
     <aside id="sidebar">
       <div class="side-head">
         <div class="brand">
@@ -38,6 +39,8 @@
       <div id="side-foot" class="side-foot"></div>
     </aside>
 
+    <div id="gutter-side" class="gutter" role="separator" aria-orientation="vertical" title="拖动调整目录区宽度（双击复位）"></div>
+
     <main id="main">
       <!-- 置顶诊断条：上线时已关闭（app.js 里 SHOW_DIAG_BAR=false）。
            日后需要排障：把 app.js 的 SHOW_DIAG_BAR 改成 true，并把下面这段取消注释即可。
@@ -61,6 +64,7 @@
         <div class="toolbar-right">
           <button id="btn-table-note">为表新建笔记</button>
           <button id="btn-insert-sql">插入 SQL 块</button>
+          <button id="btn-ai" title="打开 / 收起右侧 AI 助手栏（Ctrl/Cmd+I）">AI 助手</button>
           <!-- <button id="btn-copy-sql">复制 SQL 到 DBX</button> -->
           <span class="sep"></span>
           <button id="btn-export-md">导出 .md</button>
@@ -97,6 +101,74 @@
         <span id="counter" class="counter">0 字</span>
       </div>
     </main>
+
+    <div id="gutter-ai" class="gutter" role="separator" aria-orientation="vertical" title="拖动调整 AI 助手宽度（双击复位）"></div>
+
+    <!-- AI 助手：常驻右栏（不是弹窗）。结果只在用户点「插入/替换/追加」时才写回笔记。 -->
+    <aside id="ai-panel" class="ai-panel" hidden>
+      <div class="aip-head">
+        <span class="aip-brand">AI 助手</span>
+        <span id="aip-model" class="aip-model"></span>
+        <button id="aip-cfg-toggle" class="icon-btn" title="配置 / 更新 AI 模型">&#9881;</button>
+        <button id="aip-clear-log" class="icon-btn" title="清空对话记录">&#9851;</button>
+        <button id="aip-close" class="icon-btn" title="收起（Ctrl/Cmd+I）">&#10005;</button>
+      </div>
+
+      <!-- 配置区：默认收起。改完点「保存」后长期有效（密钥默认只在本次会话内有效）。 -->
+      <div id="aip-cfg" class="aip-cfg" hidden>
+        <label class="aip-check">
+          <input id="aip-enabled" type="checkbox" />
+          <span>启用 AI 功能</span>
+        </label>
+        <label class="m-label" for="aip-provider">服务类型</label>
+        <select id="aip-provider" class="m-input">
+          <option value="openai">OpenAI 兼容（DeepSeek / 通义 / Kimi / 自建网关）</option>
+          <option value="anthropic">Anthropic（Claude）</option>
+          <option value="ollama">Ollama（本地模型，无需密钥）</option>
+        </select>
+        <label class="m-label" for="aip-baseurl">API 地址</label>
+        <input id="aip-baseurl" class="m-input" placeholder="https://api.deepseek.com/v1" autocomplete="off" />
+        <label class="m-label" for="aip-modelinput">模型名称</label>
+        <input id="aip-modelinput" class="m-input" placeholder="deepseek-chat" autocomplete="off" />
+        <label class="m-label" for="aip-key">API 密钥</label>
+        <input id="aip-key" class="m-input" type="password" placeholder="留空 = 不修改已保存的密钥" autocomplete="off" />
+        <label class="aip-check">
+          <input id="aip-remember" type="checkbox" />
+          <span>在本机记住密钥（明文存放在本机插件数据目录，非共享电脑再勾选）</span>
+        </label>
+        <label class="m-label" for="aip-sysprompt">自定义人设（可选）</label>
+        <textarea id="aip-sysprompt" class="m-text" placeholder="留空则使用内置的写作助手人设"></textarea>
+        <div class="aip-2col">
+          <label><span class="m-label">单次超时（秒）</span><input id="aip-timeout" class="m-input" type="number" min="5" max="300" /></label>
+          <label><span class="m-label">单次送入上限（字符）</span><input id="aip-maxchars" class="m-input" type="number" min="500" max="200000" /></label>
+        </div>
+        <div class="aip-cfg-actions">
+          <button id="aip-test">测试连接</button>
+          <button id="aip-save" class="primary">保存</button>
+          <button id="aip-clear">清除本机配置</button>
+        </div>
+        <div id="aip-cfg-msg" class="aip-msg"></div>
+      </div>
+
+      <div id="aip-scope" class="aip-scope"></div>
+      <div id="aip-tabs" class="aip-tabs"></div>
+
+      <div id="aip-log" class="aip-log">
+        <div class="aip-hint">
+          选择一种任务后点下方按钮。<br />
+          有选中文本时只处理选中部分，否则处理整篇笔记。<br />
+          结果不会自动写回 —— 由你选择「插入到光标 / 替换选中 / 追加到末尾 / 复制」。
+        </div>
+      </div>
+
+      <div class="aip-compose">
+        <textarea id="aip-input" class="aip-input" placeholder="（可选）额外要求 / 你的问题"></textarea>
+        <div class="aip-compose-bar">
+          <span id="aip-status" class="aip-status"></span>
+          <button id="aip-go" class="primary">开始分析</button>
+        </div>
+      </div>
+    </aside>
   </div>
 
   <!-- 通用弹窗：重命名 / 确认 / 移动 / 导出降级 -->

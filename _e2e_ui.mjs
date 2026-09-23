@@ -20,6 +20,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import http from "node:http";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 
@@ -558,6 +559,236 @@ if (bkCall && fs.existsSync(bkCall.path)) {
       check("被删的正文进了回收站（可捞回，不是销毁）", trashCount >= 1, "trash 里的 .md 数=" + trashCount);
     }
   }
+}
+
+/* ---------- 14) AI 助手：右侧常驻栏（不是弹窗）+ 三栏拖拽 ---------- */
+{
+  const cssNum = (name) => parseInt($("app").style.getPropertyValue(name), 10) || 0;
+  const dragGutter = async (el, dx) => {
+    fire(el, "pointerdown", { button: 0, clientX: 500, clientY: 300 });
+    fire(doc, "pointermove", { clientX: 500 + dx, clientY: 300 });
+    fire(doc, "pointerup", { clientX: 500 + dx, clientY: 300 });
+    await sleep(80);   // 让偏好落盘的 promise 走完
+  };
+
+  check("工具栏有「AI 助手」按钮", !!$("btn-ai"));
+  check("AI 栏初始收起", $("ai-panel").hidden === true && $("app").getAttribute("data-ai") === "off",
+    "data-ai=" + $("app").getAttribute("data-ai"));
+  check("两条分隔条都在（目录|笔记、笔记|AI）", !!$("gutter-side") && !!$("gutter-ai"));
+  check("默认宽度写进了 CSS 变量", cssNum("--side-w") > 0 && cssNum("--ai-w") > 0,
+    cssNum("--side-w") + " / " + cssNum("--ai-w"));
+
+  // 必须选一篇「有内容」的笔记：空笔记会被正确拦下（"这条笔记还没有内容"）
+  const aiNote = [...doc.querySelectorAll("#tree .node")].find((el) =>
+    el.getAttribute("data-type") === "note" && /欢迎使用|DBX 使用心得|重构验证/.test(el.textContent));
+  check("AI 用例：目录树里有带内容的笔记", !!aiNote,
+    [...doc.querySelectorAll("#tree .node")].map((e) => e.textContent).join(" | "));
+
+  if ($("btn-ai") && aiNote) {
+    aiNote.click();
+    await sleep(40);
+    $("btn-ai").click();
+    await waitFor(() => $("ai-panel").hidden === false, 6000, "AI 栏");
+
+    check("点「AI 助手」打开的是右侧常驻栏，而不是弹窗",
+      $("ai-panel").hidden === false && $("app").getAttribute("data-ai") === "on" && $("modal").hidden === true,
+      "data-ai=" + $("app").getAttribute("data-ai") + " · modal.hidden=" + $("modal").hidden);
+    check("AI 栏里有任务切换（分析/润色/续写/提问）",
+      ["分析", "润色", "续写", "提问"].every((t) =>
+        [...$("aip-tabs").querySelectorAll("button")].some((b) => b.textContent === t)),
+      [...$("aip-tabs").querySelectorAll("button")].map((b) => b.textContent).join(" | "));
+    check("范围提示指向当前笔记", /《.+》/.test($("aip-scope").textContent), $("aip-scope").textContent);
+    check("AI 栏有对话记录区与输入区", !!$("aip-log") && !!$("aip-input") && !!$("aip-go"));
+
+    await sleep(500);   // 等 ai/config 回来
+    check("未配置 AI：给出可操作的提示而不是报错",
+      /还缺/.test($("aip-status").textContent), $("aip-status").textContent);
+    check("未配置时自动展开配置区（省得用户猜为什么点不动）", $("aip-cfg").hidden === false);
+    check("配置区含地址 / 模型 / 密钥 / 记住密钥 / 人设",
+      !!$("aip-baseurl") && !!$("aip-modelinput") && !!$("aip-key") &&
+      !!$("aip-remember") && !!$("aip-sysprompt") && !!$("aip-timeout") && !!$("aip-maxchars"));
+    check("未配置时「生成」按钮被禁用（避免点了报错）", $("aip-go").disabled === true);
+
+    // --- 三栏拖拽 ---
+    const aiBefore = cssNum("--ai-w");
+    await dragGutter($("gutter-ai"), -60);        // AI 栏在右侧 → 往左拖 = 变宽
+    const aiAfter = cssNum("--ai-w");
+    check("拖动 AI 分隔条能改宽度", aiAfter === aiBefore + 60, aiBefore + " -> " + aiAfter);
+
+    const sideBefore = cssNum("--side-w");
+    await dragGutter($("gutter-side"), 40);
+    const sideAfter = cssNum("--side-w");
+    check("拖动目录区分隔条能改宽度", sideAfter === sideBefore + 40, sideBefore + " -> " + sideAfter);
+    check("拖动改的是目录区、没连带改 AI 栏", cssNum("--ai-w") === aiAfter);
+
+    // 宽度超范围要钳制（AI 栏最小 280）
+    await dragGutter($("gutter-ai"), 2000);
+    check("宽度被钳到下限（拖过头不会把 AI 栏拖没）", cssNum("--ai-w") === 280, String(cssNum("--ai-w")));
+
+    // 双击复位
+    fire($("gutter-ai"), "dblclick", {});
+    await sleep(80);
+    check("双击分隔条复位到默认宽度", cssNum("--ai-w") === 400, String(cssNum("--ai-w")));
+
+    check("宽度偏好落到了插件数据目录（不进笔记目录）",
+      fs.existsSync(path.join(DATA_DIR, "prefs.json")) &&
+      !fs.existsSync(path.join(STORAGE_DIR, "prefs.json")),
+      "data/prefs.json=" + fs.existsSync(path.join(DATA_DIR, "prefs.json")));
+    const prefsWritten = (() => {
+      try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, "prefs.json"), "utf8")); } catch { return {}; }
+    })();
+    check("偏心里含两条宽度与面板开关",
+      typeof prefsWritten.sidebarWidth === "number" && typeof prefsWritten.aiWidth === "number" &&
+      prefsWritten.aiPanelOpen === true, JSON.stringify(prefsWritten));
+
+    // --- 收起 ---
+    $("aip-close").click();
+    await sleep(80);
+    check("点 ✕ 收起 AI 栏（列宽归 0）",
+      $("ai-panel").hidden === true && $("app").getAttribute("data-ai") === "off",
+      "data-ai=" + $("app").getAttribute("data-ai"));
+
+    // 再开一次应记住「开着」的状态（用于下次打开工作台恢复）
+    $("btn-ai").click();
+    await sleep(120);
+    const prefsReopen = (() => {
+      try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, "prefs.json"), "utf8")); } catch { return {}; }
+    })();
+    check("面板开合状态被记住", prefsReopen.aiPanelOpen === true, JSON.stringify(prefsReopen));
+  }
+}
+
+/* ---------- 15) 结果回写：假模型 → 真侧车 → 面板 → 编辑器 → 磁盘 ---------- */
+// 这一节走的是完整链路，而不是把逻辑抄一遍：起一个假模型服务，接上侧车，
+// 点「生成」，再点「追加到末尾」，最后到磁盘上找内容。
+{
+  const MARK = "AI_WRITE_BACK_MARK";
+  const modelSrv = http.createServer((req, res) => {
+    let b = "";
+    req.on("data", (c) => { b += c; });
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({
+        model: "fake-e2e",
+        choices: [{ message: { content: MARK } }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }));
+    });
+  });
+  await new Promise((r) => modelSrv.listen(0, "127.0.0.1", r));
+  const port = modelSrv.address().port;
+
+  await sidecar("connection/connect", {
+    connection: {
+      id: CONN_ID, name: "MD 笔记",
+      config: { storage_dir: STORAGE_DIR },
+      external_config: {
+        ai_enabled: true, ai_provider: "openai",
+        ai_base_url: `http://127.0.0.1:${port}/v1`, ai_model: "fake-e2e",
+      },
+      connection_secrets: { ai_api_key: "sk-e2e-secret-123456" },
+    },
+    connectionId: CONN_ID,
+  });
+
+  // 收起再打开 = 强制重新拉一次配置（面板只在打开与显式操作时刷新）
+  if (!$("ai-panel").hidden) { $("btn-ai").click(); await sleep(80); }
+  $("btn-ai").click();
+  await waitFor(() => $("aip-go").disabled === false, 8000, "AI 就绪");
+  check("配置就绪后「生成」可用，标题显示模型名",
+    $("aip-go").disabled === false && /fake-e2e/.test($("aip-model").textContent),
+    $("aip-model").textContent + " | " + $("aip-status").textContent);
+  check("就绪后不再提示「还缺」", !/还缺/.test($("aip-status").textContent), $("aip-status").textContent);
+
+  const editor = $("editor");
+  const before = String(editor.value || "");
+  $("aip-go").click();
+  await waitFor(() => $("aip-log").textContent.indexOf(MARK) >= 0, 10000, "AI 结果");
+  check("AI 结果出现在对话记录里", $("aip-log").textContent.indexOf(MARK) >= 0);
+
+  const entryBtns = [...$("aip-log").querySelectorAll("button")];
+  check("每条结果都带四个操作按钮",
+    ["插入到光标", "替换选中", "追加到末尾", "复制"].every((t) => entryBtns.some((b) => b.textContent === t)),
+    entryBtns.map((b) => b.textContent).join(" | "));
+
+  // 复制：不该动正文
+  const copyBtn = entryBtns.find((b) => b.textContent === "复制");
+  if (copyBtn) {
+    copyBtn.click();
+    await sleep(80);
+    check("「复制」不修改正文", String(editor.value || "") === before);
+  }
+
+  // 追加到末尾
+  const appendBtn = entryBtns.find((b) => b.textContent === "追加到末尾");
+  if (appendBtn) {
+    appendBtn.click();
+    await sleep(400);
+    const after = String(editor.value || "");
+    check("「追加到末尾」把结果写进了编辑器",
+      after.indexOf(MARK) >= 0 && after.length > before.length && after.indexOf(before) === 0,
+      JSON.stringify(after.slice(-30)));
+
+    const hit = (function walk(dir) {
+      let entries = [];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return ""; }
+      for (const e of entries) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          const r = walk(p);
+          if (r) { return r; }
+        } else if (e.name.endsWith(".md")) {
+          try { if (fs.readFileSync(p, "utf8").indexOf(MARK) >= 0) { return p; } } catch { /* ignore */ }
+        }
+      }
+      return "";
+    })(STORAGE_DIR);
+    check("写回后立刻落盘（磁盘上能找到该内容）", !!hit, hit ? path.relative(STORAGE_DIR, hit) : "未找到");
+
+    // 「插入到光标」：把光标放到开头再插入，结果应出现在最前面
+    editor.selectionStart = editor.selectionEnd = 0;
+    const insertBtn = entryBtns.find((b) => b.textContent === "插入到光标");
+    if (insertBtn) {
+      insertBtn.click();
+      await sleep(300);
+      check("「插入到光标」插到光标处（开头）",
+        String(editor.value || "").indexOf(MARK) === 0,
+        JSON.stringify(String(editor.value || "").slice(0, 24)));
+    }
+
+    // 「替换选中」：必须先弹确认框（无选区时应被拦下）
+    editor.selectionStart = editor.selectionEnd = 0;
+    const replaceBtn = entryBtns.find((b) => b.textContent === "替换选中");
+    if (replaceBtn) {
+      replaceBtn.click();
+      await sleep(120);
+      check("无选区时「替换选中」被拦下并提示（不误改正文）",
+        /没有选中内容/.test($("toast").textContent) && $("modal").hidden === true,
+        "toast=" + $("toast").textContent);
+
+      const src = String(editor.value || "");
+      editor.selectionStart = 0;
+      editor.selectionEnd = 5;
+      const selText = src.slice(0, 5);
+      replaceBtn.click();
+      await waitFor(() => $("modal").hidden === false, 3000, "替换确认框");
+      check("有选区时先弹确认框（显示将被替换的内容）",
+        /确认替换选中的内容/.test($("modal").textContent) && $("modal").textContent.indexOf(selText) >= 0,
+        $("modal").textContent.slice(0, 120));
+      const okBtn = [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "替换");
+      check("确认框里有「替换」按钮", !!okBtn);
+      if (okBtn) {
+        okBtn.click();
+        await sleep(400);
+        const replaced = String(editor.value || "");
+        // 选区是 [0,5)，结果应精确替换掉这 5 个字符（用前后拼接算出期望值，别用 includes 猜）
+        check("确认后完成替换（选区被结果取代）",
+          replaced === MARK + src.slice(5),
+          JSON.stringify(replaced.slice(0, 30)) + " vs " + JSON.stringify((MARK + src.slice(5)).slice(0, 30)));
+      }
+    }
+  }
+  modelSrv.close();
 }
 
 /* ---------- 汇总 ---------- */

@@ -2,9 +2,11 @@
 // 用法: node _verify.mjs [某个.dbxp]   不给参数时自动取 dist/ 下最新的那个，
 // 并拿它和源码 manifest.json 的版本比对（防止「验的是旧包」这种假绿）。
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
+import { spawnSync } from "node:child_process";
 
 const ROOT = "D:/core/web/dbx-pj/dbx-md-notes";
 const srcMani = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
@@ -79,6 +81,90 @@ const pkgTarget = baseName.startsWith(pkgPrefix) && baseName.endsWith(".dbxp")
 const exeSuffix = pkgTarget.startsWith("windows") ? ".exe" : "";
 const exeExpected = pkgTarget ? `bin/${pkgTarget}/dbx-plugin-mdnotes${exeSuffix}` : "";
 
+/* ---- 把包内的侧车真的启动一次，用 JSON-RPC 问它三条 ----
+ * 这是"包里的二进制确实具备新能力"的唯一可靠证明（见下方注释：grep 字符串不可靠）。
+ * 但只能对**本机平台**的包执行：交叉编译出来的 darwin/linux 二进制在本机跑不了，
+ * 那种情况标记为 skip ——「交叉编译只保证字节正确，真机冒烟仍要各平台各跑一次」。
+ */
+const HOST_TARGET = (() => {
+  const osName = process.platform === "win32" ? "windows" : process.platform;   // darwin | linux | windows
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  return `${osName}-${arch}`;
+})();
+
+function probePackagedSidecar() {
+  const out = { ok: false, detail: "", versionOk: false, version: "", probeOk: false, probeDetail: "", aiOk: false, aiDetail: "", aiSetOk: false, aiSetDetail: "", skip: false };
+  if (pkgTarget && pkgTarget !== HOST_TARGET) {
+    out.skip = true;
+    out.detail = `非本机平台（包=${pkgTarget} 本机=${HOST_TARGET}），无法执行 —— 需在该平台真机冒烟`;
+    return out;
+  }
+  const exeBytes = get(exeRel);
+  if (!exeBytes) { out.detail = "包内没有该 executable"; return out; }
+  const base = path.join(os.tmpdir(), `dbx-verify-${process.pid}-${Date.now()}`);
+  const exePath = base + (exeRel.endsWith(".exe") ? ".exe" : "");
+  const dataDir = base + "-data";
+  const storeDir = base + "-store";
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(storeDir, { recursive: true });
+    fs.writeFileSync(exePath, exeBytes);
+    if (!exeRel.endsWith(".exe")) { fs.chmodSync(exePath, 0o755); }
+    const input = [
+      JSON.stringify({ jsonrpc: "2.0", id: "1", method: "plugin/initialize", params: { host: { protocolVersions: [1] } } }),
+      JSON.stringify({ jsonrpc: "2.0", id: "2", method: "notes/probe", params: { storage_dir: storeDir } }),
+      JSON.stringify({ jsonrpc: "2.0", id: "3", method: "ai/config", params: {} }),
+      JSON.stringify({ jsonrpc: "2.0", id: "4", method: "ai/setConfig", params: { persist: false, model: "probe" } }),
+    ].join("\n") + "\n";
+    const r = spawnSync(exePath, [], {
+      input, encoding: "utf8", timeout: 20000,
+      env: { ...process.env, DBX_PLUGIN_DATA_DIR: dataDir },
+    });
+    const replies = new Map();
+    String(r.stdout || "").split(/\r?\n/).forEach((line) => {
+      if (!line.trim()) return;
+      try {
+        const m = JSON.parse(line);
+        if (m && m.id != null) { replies.set(String(m.id), m); }
+      } catch { /* 非 JSON 行忽略 */ }
+    });
+    const init = replies.get("1");
+    if (init && init.result && init.result.plugin) {
+      out.ok = true;
+      out.version = init.result.plugin.version;
+      out.versionOk = out.version === mani.version;
+    } else if (init && init.error) {
+      out.detail = JSON.stringify(init.error).slice(0, 140);
+    } else {
+      out.detail = `没有回应（exit=${r.status} stderr=${String(r.stderr || "").slice(0, 140)}）`;
+    }
+    const pb = replies.get("2");
+    out.probeOk = !!pb && !pb.error && !!(pb.result && pb.result.ok);
+    out.probeDetail = pb
+      ? (pb.error ? JSON.stringify(pb.error).slice(0, 100) : "ok dir=" + ((pb.result || {}).dir || ""))
+      : "无响应";
+    const ai = replies.get("3");
+    out.aiOk = !!ai && !ai.error && !!(ai.result && typeof ai.result.ready === "boolean");
+    out.aiDetail = ai
+      ? (ai.error ? JSON.stringify(ai.error).slice(0, 100) : JSON.stringify(ai.result).slice(0, 140))
+      : "无响应";
+    const setCfg = replies.get("4");
+    out.aiSetOk = !!setCfg && !setCfg.error && !!(setCfg.result && setCfg.result.model === "probe");
+    out.aiSetDetail = setCfg
+      ? (setCfg.error ? JSON.stringify(setCfg.error).slice(0, 100) : "model=" + (setCfg.result || {}).model)
+      : "无响应";
+    return out;
+  } catch (e) {
+    out.detail = String((e && e.message) || e);
+    return out;
+  } finally {
+    for (const p of [exePath, dataDir, storeDir]) {
+      try { fs.rmSync(p, { recursive: true, force: true }); } catch { /* 忽略清理失败 */ }
+    }
+  }
+}
+const probeExe = probePackagedSidecar();
+
 const checks = [
   ["manifest.version 与源码一致", mani.version === srcVer, mani.version + " vs " + srcVer],
   ["manifest.id 与源码一致（防「验的是旧 id 的包」）", mani.id === srcMani.id, mani.id + " vs " + srcMani.id],
@@ -103,7 +189,9 @@ const checks = [
   ["普通文件带 0644 权限位", es.filter((e) => e.name !== exeRel).every((e) => ((e.ext >> 16) & 0o777) === 0o644)],
 ];
 const st = get("ui/storage.js").toString("utf8");
-const exeStr = (get(exeRel) || Buffer.alloc(0)).toString("latin1");
+// 注意：不要再拿"二进制里有没有某个字符串"当判据 —— Go 会合并/拆分行内字符串数据，
+// 短字面量（如 ai/status）不保证连续出现，grep 会给出假的 FAIL/PASS。
+// 要证明"包里的侧车确实有这个能力"，用下面的 probePackagedSidecar() 真跑一次。
 const ap = get("ui/app.js").toString("utf8");
 const ix = get("ui/index.html").toString("utf8");
 const cs = get("ui/styles.css").toString("utf8");
@@ -140,8 +228,6 @@ checks.push(
       return Object.keys(seen).filter((k) => seen[k] > 1).length === 0;
     })()],
   ["前端删除走显式 deletedIds（不再靠「不在快照里」推断删除）", ap.includes("deletedIds")],
-  ["打包的侧车含「显式删除」语义（deletedIds 结构标签）", exeStr.includes("deletedIds")],
-  ["打包的侧车含回收站语义（trash）", exeStr.includes("trash")],
   ["app.js 用安全绑定 click()/on()（缺失元素不再连坐）", apCode.includes("function on(id, evName, handler, optional)")],
   ["app.js 没有对缺失元素直接取属性", dangling.length === 0, dangling.join(",")],
   ["app.js 捕获页面级未处理异常", apCode.includes("unhandledrejection") && apCode.includes('window.addEventListener("error"')],
@@ -151,13 +237,69 @@ checks.push(
   ["storage.js 的 UI_VERSION 与 manifest 一致",
     (st.match(/var UI_VERSION = "([^"]+)"/) || [])[1] === srcVer,
     (st.match(/var UI_VERSION = "([^"]+)"/) || [])[1]],
+
+  /* ---- AI 接入（v0.8.1：只用自配模型 + 右侧常驻栏，不依赖宿主内置 AI） ---- */
+  ["不依赖宿主内置 AI（manifest 未声明 host.ai）",
+    Array.isArray(mani.permissions) && !mani.permissions.includes("host.ai"), JSON.stringify(mani.permissions)],
+  ["engines.dbx 未被 AI 抬高（老宿主也能装）",
+    !!(mani.engines && !/>=\s*0\.6\.20/.test(String(mani.engines.dbx))), JSON.stringify(mani.engines)],
+  [".dbx-store.json 的 permissions 与 manifest 一致（商店会比对）",
+    (() => {
+      try {
+        const pub = JSON.parse(fs.readFileSync(path.join(ROOT, ".dbx-store.json"), "utf8"));
+        return JSON.stringify(pub.permissions) === JSON.stringify(mani.permissions);
+      } catch { return false; }
+    })()],
+  ["AI 配置字段齐全（含 ai_api_key 的 secret 绑定）",
+    (() => {
+      const cp = (mani.contributions || []).find((c) => c.type === "connection-provider");
+      const f = (cp && cp.fields) || [];
+      const by = (k) => f.find((x) => x.key === k);
+      return !!by("ai_enabled") && !!by("ai_base_url") && !!by("ai_model") &&
+        !!by("ai_api_key") && by("ai_api_key").binding === "secret";
+    })()],
+  ["有「测试 AI 连接」表单动作",
+    (() => {
+      const cp = (mani.contributions || []).find((c) => c.type === "connection-provider");
+      return !!((cp && cp.actions) || []).find((a) => a.id === "test-ai");
+    })()],
+  ["AI 助手是右侧常驻栏（#ai-panel，不是弹窗）",
+    ix.includes('id="ai-panel"') && ix.includes("data-ai=") && ap.includes("setAIPanelOpen")],
+  ["AI 栏内可直接配置 / 更新模型（保存 / 测试 / 清除）",
+    st.includes('"ai/setConfig"') && st.includes('"ai/config"') && st.includes('"ai/resetConfig"') &&
+    ap.includes("submitAIConfig") && ap.includes("testAIConfig") && ap.includes("clearLocalAIConfig")],
+  ["结果支持四种操作（插入到光标 / 替换选中 / 追加到末尾 / 复制）",
+    ap.includes('{ op: "insert"') && ap.includes('{ op: "replace"') &&
+    ap.includes('{ op: "append"') && ap.includes('{ op: "copy"')],
+  ["三栏可拖动调整宽度（两条分隔条 + 偏好持久化）",
+    ix.includes('id="gutter-side"') && ix.includes('id="gutter-ai"') &&
+    ap.includes("bindGutter") && ap.includes("setPointerCapture") &&
+    st.includes('"ui/setPrefs"') && st.includes('"ui/getPrefs"')],
+  ["AI 调用走侧车（前端不直连模型）", st.includes('"ai/chat"') && st.includes('"ai/config"')],
+  ["前端不再调用宿主内置 AI（openConversation / hostAISupported 已移除）",
+    !ap.includes("hostAISupported") && !ap.includes("openConversation") && !st.includes("openConversation")],
+  ["前端/包内没有硬编码的 API 密钥形态", !/sk-[A-Za-z0-9_-]{16,}/.test(ap + st)],
+
+  /* ---- 包内二进制「真跑一次」（仅本机平台；跨平台包无法执行，标记为 SKIP） ---- */
+  ["包内侧车能启动并完成 plugin/initialize", probeExe.ok, probeExe.detail, probeExe.skip ? "skip" : ""],
+  ["包内侧车自报版本与 manifest 一致", probeExe.versionOk, probeExe.version, probeExe.skip ? "skip" : ""],
+  ["包内侧车支持 notes/probe（写盘通道可用）", probeExe.probeOk, probeExe.probeDetail, probeExe.skip ? "skip" : ""],
+  ["包内侧车支持 ai/config（AI 功能真的在包里）", probeExe.aiOk, probeExe.aiDetail, probeExe.skip ? "skip" : ""],
+  ["包内侧车支持 ai/setConfig（面板改配置真的可用）", probeExe.aiSetOk, probeExe.aiSetDetail, probeExe.skip ? "skip" : ""],
 );
 
 console.log("=== 校验 ===");
 let fails = 0;
-for (const [name, ok, extra] of checks) {
+let skips = 0;
+for (const [name, ok, extra, mode] of checks) {
+  if (mode === "skip") {
+    skips++;
+    console.log("  SKIP  " + name + (extra ? "  |  " + extra : ""));
+    continue;
+  }
   if (!ok) fails++;
   console.log("  " + (ok ? "PASS" : "FAIL") + "  " + name + (extra ? "  |  " + extra : ""));
 }
-console.log("\nRESULT: " + (fails ? "FAIL(" + fails + ")" : "PASS"));
+console.log("\nRESULT: " + (fails ? "FAIL(" + fails + ")" : "PASS") +
+  (skips ? "（另有 " + skips + " 项因非本机平台跳过）" : ""));
 process.exit(fails ? 1 : 0);
