@@ -362,8 +362,7 @@ button.danger:hover { background: var(--danger-soft); }
 .title-input:hover { border-color: var(--border); }
 .title-input:focus { outline: none; border-color: var(--accent); background: var(--bg-elev); }
 
-.toolbar-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.toolbar-right .sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+.toolbar-right { display: flex; align-items: center; gap: 6px; }
 /* 「AI 助手」按钮：右栏开着时高亮，一眼能看出状态 */
 .toolbar-right button.on {
   border-color: var(--accent);
@@ -371,6 +370,41 @@ button.danger:hover { background: var(--danger-soft); }
   color: var(--accent);
   font-weight: 600;
 }
+
+/* ---------------- 工具栏「更多」下拉 ---------------- */
+.more-wrap { position: relative; }
+.more-btn { color: var(--fg-muted); }
+.more-btn.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.more-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 168px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+}
+/* display:flex 会顶掉 [hidden] 的默认隐藏，必须显式声明 */
+.more-menu[hidden] { display: none; }
+.more-menu button {
+  width: 100%;
+  text-align: left;
+  border-color: transparent;
+  background: transparent;
+  font-size: 12.5px;
+}
+.more-menu button:hover { background: var(--bg-hover); border-color: transparent; }
 
 /* ---------------- 编辑 / 预览 ---------------- */
 .panes {

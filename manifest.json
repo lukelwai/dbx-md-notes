@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "com.lwai.mdnotes",
   "name": "AI.MD 笔记",
-  "version": "0.8.4",
+  "version": "0.8.6",
   "publisher": "lwai",
   "description": "Markdown 笔记，支持连接类型：在 DBX 中新建「AI.MD 笔记」连接即可打开笔记工作台。笔记落盘到连接配置里的存储目录，并可作为 mdnotes:// 虚拟文件系统浏览编辑。内置 AI 助手（右侧常驻栏），可接入任意 OpenAI 兼容 / Anthropic / Ollama 模型对笔记做分析、润色、续写与问答。",
   "icon": "assets/plugin.svg",

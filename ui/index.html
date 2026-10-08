@@ -62,17 +62,21 @@
       <div class="toolbar">
         <input id="title" class="title-input" placeholder="笔记标题" />
         <div class="toolbar-right">
-          <button id="btn-table-note">为表新建笔记</button>
-          <button id="btn-insert-sql">插入 SQL 块</button>
+          <!-- 只留两个高频动作固定显示；其余收进「更多」，避免工具栏在窄窗口里换行、挤占正文高度 -->
+          <button id="btn-insert-sql" title="在光标处插入一个 ```sql 代码块">插入 SQL 块</button>
           <button id="btn-ai" title="打开 / 收起右侧 AI 助手栏（Ctrl/Cmd+I）">AI 助手</button>
-          <!-- <button id="btn-copy-sql">复制 SQL 到 DBX</button> -->
-          <span class="sep"></span>
-          <button id="btn-export-md">导出 .md</button>
-          <!-- 导入功能暂时下线（app.js 里 ENABLE_IMPORT=false）。
-               恢复：把 app.js 的 ENABLE_IMPORT 改成 true，并把下面两处取消注释。 -->
-          <!-- <button id="btn-import-md">导入 .md</button> -->
-          <button id="btn-backup-zip">备份 zip</button>
-          <button id="btn-restore-zip">恢复备份…</button>
+          <div class="more-wrap">
+            <button id="btn-more" class="more-btn" title="更多操作" aria-haspopup="true" aria-expanded="false">更多 ▾</button>
+            <div id="more-menu" class="more-menu" role="menu" hidden>
+              <button id="btn-table-note" role="menuitem">为表新建笔记</button>
+              <button id="btn-export-md" role="menuitem">导出 .md</button>
+              <!-- 导入功能暂时下线（app.js 里 ENABLE_IMPORT=false）。
+                   恢复：把 app.js 的 ENABLE_IMPORT 改成 true，并把下面两处取消注释。 -->
+              <!-- <button id="btn-import-md" role="menuitem">导入 .md</button> -->
+              <button id="btn-backup-zip" role="menuitem">备份 zip</button>
+              <button id="btn-restore-zip" role="menuitem">恢复备份…</button>
+            </div>
+          </div>
         </div>
       </div>
 

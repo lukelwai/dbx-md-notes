@@ -425,18 +425,50 @@ if (folderRow && dragRow) {
     movedPath || "（没找到）");
 }
 
-/* ---------- 11) 导出 / 备份走宿主「另存为」（可自选目录） ---------- */
+/* ---------- 11) 工具栏结构（两个固定按钮 + 「更多」折叠） ---------- */
 const saveCalls = window.__saveCalls;
 check("storage.js 识别到宿主 saveFile 能力", S.hasHostSave() === true);
-check("工具栏有「恢复备份…」按钮", !!$("btn-restore-zip"));
-check("恢复用的 zip 文件选择器存在", !!$("backup-input"));
 
-// 导出：先选中一篇笔记
+{
+  const right = doc.querySelector(".toolbar-right");
+  const topBtns = [...right.children].filter((el) => el.tagName === "BUTTON").map((b) => b.id);
+  check("工具栏只固定显示「插入 SQL 块」和「AI 助手」两个动作",
+    topBtns.join(",") === "btn-insert-sql,btn-ai", topBtns.join(",") || "（无）");
+  check("低频动作都收进「更多」下拉（导出/备份/恢复/为表新建）",
+    ["btn-table-note", "btn-export-md", "btn-backup-zip", "btn-restore-zip"]
+      .every((id) => $("more-menu").contains($(id))),
+    [...$("more-menu").querySelectorAll("button")].map((b) => b.id).join(","));
+  check("「更多」菜单默认收起", $("more-menu").hidden === true);
+  check("恢复用的 zip 文件选择器存在", !!$("backup-input"));
+
+  $("btn-more").click();
+  await sleep(30);
+  check("点「更多」展开菜单并标记 aria-expanded",
+    $("more-menu").hidden === false && $("btn-more").getAttribute("aria-expanded") === "true",
+    "hidden=" + $("more-menu").hidden);
+  fire(doc.body, "click");
+  await sleep(30);
+  check("点空白处收起「更多」菜单",
+    $("more-menu").hidden === true && $("btn-more").getAttribute("aria-expanded") === "false",
+    "hidden=" + $("more-menu").hidden);
+
+  $("btn-more").click();
+  await sleep(30);
+  doc.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await sleep(30);
+  check("Esc 收起「更多」菜单", $("more-menu").hidden === true, "hidden=" + $("more-menu").hidden);
+}
+
+/* ---------- 11b) 导出 / 备份走宿主「另存为」（可自选目录） ---------- */
+// 导出：先选中一篇笔记，再从「更多」里点（顺便验证点完菜单会自动收起）
 const anyNote = [...doc.querySelectorAll("#tree .node")].find((el) => el.getAttribute("data-type") === "note");
 anyNote.click();
 await sleep(50);
+$("btn-more").click();
+await sleep(30);
 $("btn-export-md").click();
 await sleep(600);
+check("点菜单项执行动作后菜单自动收起", $("more-menu").hidden === true, "hidden=" + $("more-menu").hidden);
 const exCall = saveCalls.find((c) => c.contentType === "text/markdown");
 check("「导出 .md」弹宿主另存为（带 text/markdown 类型）", !!exCall,
   saveCalls.map((c) => c.fileName + ":" + c.contentType).join(" | ") || "（没有调用）");
@@ -444,7 +476,9 @@ check("导出的 .md 落在「用户所选目录」",
   !!exCall && fs.existsSync(exCall.path) && exCall.path.startsWith(SAVED_DIR),
   exCall ? exCall.path : "（无）");
 
-// 备份
+// 备份（同样从「更多」进入）
+$("btn-more").click();
+await sleep(30);
 $("btn-backup-zip").click();
 await sleep(900);
 const bkCall = saveCalls.find((c) => c.contentType === "application/zip");

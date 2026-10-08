@@ -110,7 +110,8 @@ if (badRefs.length) {
 // (b) 关键 UI 节点必须在 index.html 里真实存在
 const CRITICAL = ["main", "store-status", "store-text", "tree", "editor", "title",
   "ai-panel", "aip-scroll", "aip-log", "aip-go", "aip-target", "aip-mode-none",
-  "aip-view-chat", "aip-view-create", "ai-cfg-modal", "aic-save", "gutter-side", "gutter-ai"];
+  "aip-view-chat", "aip-view-create", "ai-cfg-modal", "aic-save", "gutter-side", "gutter-ai",
+  "btn-insert-sql", "btn-ai", "btn-more", "more-menu", "btn-export-md", "btn-restore-zip"];
 const missingCritical = CRITICAL.filter(id => !liveIds.has(id));
 if (missingCritical.length) {
   console.error("\n[FATAL] index.html 缺少关键元素：" + missingCritical.join(", ") + "\n");
@@ -175,6 +176,21 @@ if (enableImport[1] === "true" && !(importBtnLive && importInputLive)) {
 if ((mani.permissions || []).indexOf("host.ai") >= 0) {
   console.error("\n[FATAL] manifest 声明了 host.ai：本插件只用自配第三方模型，不应依赖宿主内置 AI。");
   console.error("        它会把最低宿主抬到 0.6.20，且旧宿主会在安装阶段直接拒绝整个包。\n");
+  process.exit(1);
+}
+
+// (d3b) 贡献点：本插件【刻意不声明】command / menus（侧边栏 / 工具栏 / 命令面板入口）。
+//       实测（v0.8.5 做过一版）：宿主对「声明了命令的插件」不再显示原来的「文件浏览入口」，
+//       mdnotes:// 的快捷入口会被顶掉；而且这两个贡献点是 0.6.21 才引入的，会把最低宿主从 0.5.68 抬上去。
+//       所以整条路撤回（v0.8.6），并在这里固化成闸门，防止日后又被顺手加回来。
+const newContribs = (mani.contributions || [])
+  .filter((c) => c.type === "command" || c.type === "menus")
+  .map((c) => c.type);
+if (newContribs.length) {
+  console.error("\n[FATAL] manifest 声明了 " + newContribs.join(" / ") + " 贡献点：本插件刻意不做侧边栏/命令面板入口。");
+  console.error("        ① 有命令的插件会失去原来的「文件浏览入口」→ mdnotes:// 的快捷入口被顶掉；");
+  console.error("        ② 这两个贡献点是 DBX 0.6.21 引入的，声明它会把最低宿主从 0.5.68 抬到 0.6.21。");
+  console.error("        打开笔记工作台走「连接」或插件详情里的工作台入口即可。\n");
   process.exit(1);
 }
 // (d4) .dbx-store.json 的 permissions 必须与 manifest 一致，

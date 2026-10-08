@@ -60,7 +60,10 @@ CRITICAL = ["main", "store-status", "store-text",
             "tree", "editor", "title",
             "ai-panel", "aip-scroll", "aip-log", "aip-go", "aip-target", "aip-mode-none",
             "aip-view-chat", "aip-view-create", "ai-cfg-modal", "aic-save",
-            "gutter-side", "gutter-ai"]
+            "gutter-side", "gutter-ai",
+            # 工具栏：两个固定按钮 + 「更多」下拉（其余动作收在菜单里）
+            "btn-insert-sql", "btn-ai", "btn-more", "more-menu",
+            "btn-export-md", "btn-restore-zip"]
 missing = [c for c in CRITICAL if c not in live_ids]
 if missing:
     print("!! index.html 缺关键元素: %s" % ", ".join(missing))

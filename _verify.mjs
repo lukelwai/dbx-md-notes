@@ -252,8 +252,35 @@ checks.push(
   /* ---- AI 接入（v0.8.1：只用自配模型 + 右侧常驻栏，不依赖宿主内置 AI） ---- */
   ["不依赖宿主内置 AI（manifest 未声明 host.ai）",
     Array.isArray(mani.permissions) && !mani.permissions.includes("host.ai"), JSON.stringify(mani.permissions)],
-  ["engines.dbx 未被 AI 抬高（老宿主也能装）",
-    !!(mani.engines && !/>=\s*0\.6\.20/.test(String(mani.engines.dbx))), JSON.stringify(mani.engines)],
+
+  /* ---- 刻意不做「侧边栏 / 工具栏 / 命令面板」入口（v0.8.5 做过、v0.8.6 撤回） ---- */
+  ["manifest 刻意不声明 command / menus（会顶掉 mdnotes:// 的文件浏览入口，并把最低宿主抬到 0.6.21）",
+    !(mani.contributions || []).some((c) => c.type === "command" || c.type === "menus"),
+    (mani.contributions || []).map((c) => c.type).join(" / ")],
+  ["engines.dbx 保持 >=0.5.68（没有为了新贡献点抬高）",
+    String(mani.engines && mani.engines.dbx) === ">=0.5.68", JSON.stringify(mani.engines)],
+  ["本地化键都能对上真实贡献点 id（宿主会把对不上的键判为无效清单）",
+    (() => {
+      const loc = mani.localizations && mani.localizations.en;
+      if (!loc || !loc.contributions) { return false; }
+      const ids = new Set((mani.contributions || []).map((c) => c.id));
+      return Object.keys(loc.contributions).every((k) => ids.has(k));
+    })(),
+    Object.keys((mani.localizations && mani.localizations.en && mani.localizations.en.contributions) || {}).join(", ")],
+
+  /* ---- 工具栏折叠（v0.8.5：只保留两个高频按钮） ---- */
+  ["工具栏只固定显示「插入 SQL 块」「AI 助手」，其余收进「更多」",
+    ix.includes('id="btn-insert-sql"') && ix.includes('id="btn-ai"') &&
+    ix.includes('id="btn-more"') && ix.includes('id="more-menu"') &&
+    ap.includes("toggleMoreMenu") && ap.includes("closeMoreMenu")],
+  ["「更多」菜单默认收起，且能靠点空白 / Esc 关闭",
+    /id="more-menu"[^>]*hidden/.test(ix) &&
+    ap.includes('setAttribute("aria-expanded"') && ap.includes("closeMoreMenu();")],
+  ["「更多」菜单显式声明 [hidden]（否则 display:flex 会顶掉默认隐藏）",
+    /\.more-menu\[hidden\]\s*\{[^}]*display:\s*none/.test(cs)],
+  ["低频动作仍在 DOM 里且 id 未变（导出/备份/恢复/为表新建）",
+    liveIds.has("btn-export-md") && liveIds.has("btn-backup-zip") &&
+    liveIds.has("btn-restore-zip") && liveIds.has("btn-table-note")],
   [".dbx-store.json 的 permissions / name 与 manifest 一致（商店会比对）",
     (() => {
       try {

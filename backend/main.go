@@ -37,7 +37,7 @@ import (
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
 	pluginID      = "com.lwai.mdnotes"
-	pluginVersion = "0.8.4" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginVersion = "0.8.6" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -985,12 +985,12 @@ func notesLoad() (any, *dbxpluginsdk.PluginError) {
 	if len(m.Nodes) == 0 && !metaExists() {
 		// 首次运行：还没有任何数据，让前端去放示例笔记
 		return map[string]any{
-			"data":   nil,
-			"path":   metaPath(),
-			"dir":    notesDir(),
-			"ok":     true,
+			"data":       nil,
+			"path":       metaPath(),
+			"dir":        notesDir(),
+			"ok":         true,
 			"configured": dirConfigured(),
-			"pending": takePending(),
+			"pending":    takePending(),
 		}, nil
 	}
 	nodes := []map[string]any{}
@@ -1019,17 +1019,17 @@ func notesLoad() (any, *dbxpluginsdk.PluginError) {
 	}
 	return map[string]any{
 		"data": map[string]any{
-			"version":   m.Version,
-			"nodes":     nodes,
-			"activeId":  m.ActiveID,
-			"expanded":  m.Expanded,
-			"view":      m.View,
+			"version":  m.Version,
+			"nodes":    nodes,
+			"activeId": m.ActiveID,
+			"expanded": m.Expanded,
+			"view":     m.View,
 		},
-		"path":   metaPath(),
-		"dir":    notesDir(),
-		"ok":     true,
+		"path":       metaPath(),
+		"dir":        notesDir(),
+		"ok":         true,
 		"configured": dirConfigured(),
-		"pending": takePending(),
+		"pending":    takePending(),
 	}, nil
 }
 

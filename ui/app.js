@@ -1059,6 +1059,27 @@
       document.addEventListener("click", closeCtxMenu, { once: true });
     }, 0);
   }
+
+  // ---------------- 工具栏「更多」下拉 ----------------
+  // 为什么收起来：原来工具栏一排放 6 个按钮，窗口一窄就换行、把正文往下挤。
+  // 现在固定只显示「插入 SQL 块」和「AI 助手」，其余在这里展开。
+  function setMoreMenuOpen(open) {
+    var m = $("more-menu");
+    if (!m) { return; }
+    var next = !!open;
+    m.hidden = !next;
+    var b = $("btn-more");
+    if (b) {
+      b.setAttribute("aria-expanded", next ? "true" : "false");
+      if (next) { b.classList.add("on"); } else { b.classList.remove("on"); }
+    }
+  }
+  function closeMoreMenu() { setMoreMenuOpen(false); }
+  function toggleMoreMenu() {
+    var m = $("more-menu");
+    setMoreMenuOpen(!!(m && m.hidden));
+  }
+
   function moveNodeFlow(n) {
     moveModal(n).then(function (dest) {
       if (dest === null) { return; }
@@ -2476,6 +2497,15 @@
 
     click("btn-table-note", function () { openTableModal(null); });
     click("btn-insert-sql", insertSqlBlock);
+    click("btn-more", toggleMoreMenu);
+    // 点「更多」里的任一项都收起菜单（动作本身由各自的 onclick 执行，这里只负责关）
+    var moreMenu = $("more-menu");
+    if (moreMenu) {
+      moreMenu.addEventListener("click", function (e) {
+        var t = e.target;
+        if (t && t.tagName === "BUTTON") { closeMoreMenu(); }
+      });
+    }
     // 工具栏的「AI 助手」是开/关（常驻右栏），不是弹窗；右键菜单则会带上具体任务
     click("btn-ai", toggleAIPanel);
     click("aip-close", function () { setAIPanelOpen(false); });
@@ -2637,13 +2667,20 @@
       }
       if (e.key === "Escape") {
         closeCtxMenu();
+        closeMoreMenu();
         if (!$("modal").hidden) { closeModal(); }
         if (!$("table-modal").hidden) { closeTableModal(); }
         if (!$("ai-cfg-modal").hidden) { closeAIConfigModal(); }
       }
     });
 
-    document.addEventListener("click", function () { closeCtxMenu(); });
+    // 点空白处收起「更多」菜单；点菜单/按钮自身（在 .more-wrap 内）不关，
+    // 否则「点开的那一下」会立刻把菜单关回去。
+    document.addEventListener("click", function (e) {
+      closeCtxMenu();
+      var wrap = document.querySelector(".more-wrap");
+      if (!wrap || !wrap.contains(e.target)) { closeMoreMenu(); }
+    });
 
     // 主题跟随 DBX
     window.addEventListener("dbx-plugin-env", function () { applyTheme(); });
