@@ -60,6 +60,7 @@ CRITICAL = ["main", "store-status", "store-text",
             "tree", "editor", "title",
             "ai-panel", "aip-scroll", "aip-log", "aip-go", "aip-target", "aip-mode-none",
             "aip-view-chat", "aip-view-create", "ai-cfg-modal", "aic-save",
+            "file-input", "dir-input",
             "gutter-side", "gutter-ai",
             # 工具栏：两个固定按钮 + 「更多」下拉（其余动作收在菜单里）
             "btn-insert-sql", "btn-ai", "btn-more", "more-menu",

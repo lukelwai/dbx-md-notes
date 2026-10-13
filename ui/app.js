@@ -636,6 +636,7 @@
     var pv = $("preview");
     if (!n) { pv.textContent = ""; return; }
     pv.innerHTML = window.MDNotes.renderMarkdown(n.content || "");
+    resolveMarkdownImages(pv);
   }
 
   function updateCounter() {
@@ -722,12 +723,18 @@
   var SHOW_DIAG_BAR = false;
   var SHOW_DIAG_LOG_IN_MODAL = false;   // 存储状态弹窗里的「存储诊断日志」面板，默认隐藏
 
-  /* ============ 功能开关：导入 .md（暂时下线） ============
-   * 2026-09-21：导入功能容易出问题，先摘掉入口（工具栏按钮 / 右键菜单 / 隐藏 file input 全下线），
-   * 代码与处理逻辑全部保留。要恢复：把下面改成 true，并把 index.html 里 #btn-import-md 与
-   * #file-input 两处注释取消即可 —— 打包闸门会校验「开关与 HTML 必须一致」，不一致直接拒绝打包。
+  /* ============ 功能开关：导入 .md ============
+   * v0.8.7 恢复上线（此前 v0.6.1 因「容易出问题」整体摘掉，代码保留）。
+   * 这次不只是把开关打开，而是把交互重做了：
+   *   - 入口只有一个：工具栏「更多 → 导入 .md」，弹框里再选「文件」或「文件夹」；
+   *   - 支持「选文件夹」（webkitdirectory），按相对路径重建目录结构；
+   *   - 弹框里可选目标文件夹、同名笔记怎么办（跳过/自动改名/覆盖）、每个文件的标题。
+   * v0.8.8 又去掉了「拖 .md 进编辑器 / 拖到目录树」的入口 —— 沙箱里 HTML5 拖放拿不到
+   * dataTransfer.files，做不到就不要承诺（弹框文案里的那句也已删）。
+   * 打包闸门校验「开关与 HTML 必须一致」：开关 true 时 index.html 里 #btn-import-md、
+   * #file-input 与 #dir-input 必须都在（不处于注释里），不一致直接拒绝打包。
    */
-  var ENABLE_IMPORT = false;
+  var ENABLE_IMPORT = true;
 
   var diagOpen = true;
   var diagLastSev = null;
@@ -1163,11 +1170,15 @@
   /** 备份成功后把「包里装了什么」摊开说 —— 「含配置」必须看得见，否则没人知道它能用来恢复。 */
   function backupLines(r) {
     var lines = [
-      "包含：" + (r.count || 0) + " 篇笔记 · " + (r.folders || 0) + " 个文件夹",
+      "包含：" + (r.count || 0) + " 篇笔记 · " + (r.folders || 0) + " 个文件夹"
+        + " · " + (r.assets || 0) + " 张图片",
       "已含配置：mdnotes-backup.json（版本 / 导出时间 / 原存储目录）",
       "　　　　　.mdnotes/meta.json（目录树索引，恢复出层级和标题靠它）",
       "包体积：" + fmtBytes(r.bytes)
     ];
+    if (r.assets) {
+      lines.splice(1, 0, "图片目录：assets/（笔记正文引用的图片都在这里，恢复后可直接显示）");
+    }
     if (r.storageDir) { lines.push("原存储目录：" + r.storageDir); }
     lines.push("");
     lines.push("要恢复：工具栏「恢复备份…」选中这个 zip 即可。");
@@ -1275,10 +1286,12 @@
         "备份时间：" + (bi.exportedAt || "（未记录）"),
         "插件版本：" + (bi.version || "（未记录）"),
         "备份时存储目录：" + (bi.storageDir || "（未记录）"),
-        "包含：" + r.notes + " 篇笔记 · " + r.folders + " 个文件夹",
+        "包含：" + r.notes + " 篇笔记 · " + r.folders + " 个文件夹"
+          + " · " + (r.assets || 0) + " 张图片",
         "",
         "将写入当前存储目录：" + r.storageDir,
         "同名笔记会被覆盖，目录树索引会被替换为备份时的状态。",
+        (r.assets ? "图片会一并恢复到 " + r.storageDir + "\\assets\\。" : "这份备份里没有图片。"),
         "恢复前会自动另存一份 pre-restore-*.zip 作为退路。"
       ];
       return confirmListModal("确认恢复？", lines, "开始恢复");
@@ -1293,7 +1306,8 @@
           render();
           persist(false);
           var lines = [
-            "已恢复 " + r.notes + " 篇笔记 · " + r.folders + " 个文件夹",
+            "已恢复 " + r.notes + " 篇笔记 · " + r.folders + " 个文件夹"
+              + " · " + (r.assets || 0) + " 张图片",
             "存储目录：" + r.storageDir
           ];
           lines.push(r.safetyPath
@@ -1306,29 +1320,418 @@
       toast("恢复失败：" + (e && e.message ? e.message : e), "warn");
     });
   }
-  /** 打开「导入 .md」的文件选择框。导入功能下线时不会走到这里；
-   *  取元素用安全写法（先赋值再判空），避免元素缺失时抛错把调用方连坐。 */
+  /* ---------------- 图片：粘贴 / 拖入 ----------------
+   *
+   * 为什么是「落盘 + 相对路径」而不是内嵌 base64：
+   *   1) 一张截图 base64 后体积涨 1/3，塞进 .md 会让整篇笔记的读写都变重
+   *      （整库是一次性快照读写，还受 2 MiB 桥接上限约束）；
+   *   2) 外部编辑器（VS Code / Obsidian）打开就是一堆乱码，用户根本没法维护；
+   *   3) 相对路径天然可移植：备份 zip 带上 assets/ 目录，换台机器照样看得到图。
+   * 为什么必须走侧车：沙箱前端没有磁盘权限（CSP default-src 'none'，
+   * window.origin 还是 opaque origin），唯一落盘通道就是 invoke → 侧车。
+   * 预览时再按相对路径把字节取回来，用 blob: URL 显示。
+   */
+  var IMG_MAX_EDGE = 1600;      // 最长边上限：截图通常 2~3K，压到 1600 足够看
+  var IMG_SMALL = 1024 * 1024;  // 小于 1MB 且不超尺寸就原样送出，避免二次压缩掉透明度
+  var IMG_CACHE = {};           // relPath -> blob: URL（同一篇里重复引用不重复取）
+  var IMG_CACHE_N = 0;
+
+  function imgCacheGet(rel) { return IMG_CACHE[rel] || null; }
+  function imgCachePut(rel, url) {
+    if (IMG_CACHE_N > 200) { clearImgCache(); }   // 上限，避免长时间使用后内存无限涨
+    IMG_CACHE[rel] = url;
+    IMG_CACHE_N++;
+  }
+  function clearImgCache() {
+    for (var k in IMG_CACHE) { try { URL.revokeObjectURL(IMG_CACHE[k]); } catch (e) { /* ignore */ } }
+    IMG_CACHE = {};
+    IMG_CACHE_N = 0;
+  }
+
+  /** base64 → Uint8Array（沙箱里有 atob，逐字节拼） */
+  function base64ToU8(b64) {
+    var bin = atob(String(b64 || ""));
+    var n = bin.length;
+    var out = new Uint8Array(n);
+    for (var i = 0; i < n; i++) { out[i] = bin.charCodeAt(i); }
+    return out;
+  }
+
+  /**
+   * 把渲染结果里的 <img data-src="assets/..."> 换成真正能显示的 <img src="blob:...">。
+   * 渲染是同步的、取字节是异步的，所以分两步；取不到就降级成可点击的占位（别留破图）。
+   */
+  function resolveMarkdownImages(root) {
+    if (!root || !root.querySelectorAll) { return; }
+    var imgs = root.querySelectorAll("img[data-src]");
+    for (var i = 0; i < imgs.length; i++) {
+      (function (img) {
+        var rel = img.getAttribute("data-src");
+        var hit = imgCacheGet(rel);
+        if (hit) {
+          img.removeAttribute("data-src");
+          img.src = hit;
+          return;
+        }
+        S.getAsset(rel).then(function (r) {
+          var url = URL.createObjectURL(new Blob([base64ToU8(r.dataBase64)], { type: r.mime || "image/png" }));
+          imgCachePut(rel, url);
+          img.removeAttribute("data-src");
+          img.src = url;
+        }).catch(function () {
+          img.removeAttribute("data-src");
+          var span = document.createElement("span");
+          span.className = "md-img-missing";
+          span.textContent = "🖼 图片缺失：" + rel;
+          span.title = "文件不在 assets/ 里了（被移走或删除）。点击复制路径。";
+          span.onclick = function () { copyText(rel, "图片路径"); };
+          if (img.parentNode) { img.parentNode.replaceChild(span, img); }
+        });
+      })(imgs[i]);
+    }
+  }
+
+  /** 在光标处插入文本（图片 markdown 用），并立即落盘 + 刷新预览 */
+  function insertAtCursor(text) {
+    var ed = $("editor");
+    var n = activeNote();
+    if (!ed || !n) { toast("请先在左侧选择一条笔记", "warn"); return; }
+    var v = String(ed.value || "");
+    var s = (ed.selectionStart == null) ? v.length : ed.selectionStart;
+    var e = (ed.selectionEnd == null) ? s : ed.selectionEnd;
+    ed.value = v.slice(0, s) + text + v.slice(e);
+    var pos = s + text.length;
+    ed.selectionStart = pos;
+    ed.selectionEnd = pos;
+    commitEditor(n, ed);
+  }
+
+  /**
+   * 读一个图片文件，必要时压到最长边 IMG_MAX_EDGE，返回 { mime, dataBase64 }。
+   * GIF 不压 —— canvas 会把动画拍成一张静帧，那样还不如不压。
+   */
+  function prepareImageForStore(file) {
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onerror = function () { reject(new Error("读不到图片文件")); };
+      fr.onload = function () {
+        var dataUrl = String(fr.result || "");
+        var raw = dataUrl.slice(dataUrl.indexOf(",") + 1);
+        var mime = file.type || "image/png";
+        if (mime === "image/gif" || file.size <= IMG_SMALL) {
+          resolve({ mime: mime, dataBase64: raw });
+          return;
+        }
+        var img = new Image();
+        img.onload = function () {
+          var w = img.naturalWidth || 0, h = img.naturalHeight || 0;
+          var scale = Math.min(1, IMG_MAX_EDGE / Math.max(w, h));
+          if (scale >= 1) { resolve({ mime: mime, dataBase64: raw }); return; }
+          var cv = document.createElement("canvas");
+          cv.width = Math.max(1, Math.round(w * scale));
+          cv.height = Math.max(1, Math.round(h * scale));
+          cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+          // PNG 保留透明通道；其余按 JPEG 压（照片类能小一个量级）
+          var out = (mime === "image/png") ? "image/png" : "image/jpeg";
+          cv.toBlob(function (blob) {
+            if (!blob) { reject(new Error("图片压缩失败")); return; }
+            var fr2 = new FileReader();
+            fr2.onload = function () {
+              var s = String(fr2.result || "");
+              resolve({ mime: out, dataBase64: s.slice(s.indexOf(",") + 1) });
+            };
+            fr2.onerror = function () { reject(new Error("读不到压缩后的图片")); };
+            fr2.readAsDataURL(blob);
+          }, out, 0.85);
+        };
+        img.onerror = function () { reject(new Error("不是有效的图片文件")); };
+        img.src = dataUrl;
+      };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  function altForFileName(name) {
+    var base = String(name || "").replace(/\.[a-z0-9]+$/i, "");
+    return base || "图片";
+  }
+
+  /** 粘贴/拖入一个图片：压缩 → 侧车落盘 → 在光标处插入相对路径 */
+  function insertImageFile(file) {
+    prepareImageForStore(file).then(function (out) {
+      return S.putAsset(out.mime, out.dataBase64, file.name).then(function (r) {
+        insertAtCursor("\n![" + altForFileName(file.name) + "](" + r.relPath + ")\n");
+        toast("已插入图片 " + r.relPath + "（" + Math.round(r.bytes / 1024) + " KB）");
+      });
+    }).catch(function (e) {
+      toast("图片插入失败：" + aiErrText(e), "warn");
+    });
+  }
+
+  /** 拖进来的东西里有没有图片（.md 的拖放导入已下线，不再接管） */
+  function hasDroppableImage(dt) {
+    if (!dt || !dt.files) { return false; }
+    for (var i = 0; i < dt.files.length; i++) {
+      if (/^image\//.test(dt.files[i].type || "")) { return true; }
+    }
+    return false;
+  }
+
+  /** 编辑器上的粘贴 / 拖入图片。
+   *  注意：**只处理图片**。曾经还支持把 .md 拖进来触发导入，但沙箱里 HTML5 拖放拿不到
+   *  dataTransfer.files（拖拽一律出禁止光标），功能实际不可用 —— 已整体去掉，
+   *  导入统一走「更多 → 导入 .md」，不再给用户一个做不到的说明。 */
+  function bindEditorImageCapture() {
+    var ed = $("editor");
+    if (!ed) { return; }
+    ed.addEventListener("paste", function (e) {
+      var items = (e.clipboardData && e.clipboardData.items) || [];
+      var file = null;
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it.kind === "file" && /^image\//.test(it.type || "")) { file = it.getAsFile(); break; }
+      }
+      if (!file) { return; }        // 纯文本粘贴：走默认行为
+      e.preventDefault();           // 否则浏览器会把一长串 data: URL 塞进正文
+      insertImageFile(file);
+    });
+    var onDrop = function (e) {
+      var dt = e.dataTransfer;
+      if (!dt || !dt.files || !dt.files.length) { return; }
+      var img = null;
+      for (var i = 0; i < dt.files.length; i++) {
+        if (/^image\//.test(dt.files[i].type || "")) { img = img || dt.files[i]; }
+      }
+      if (img) { e.preventDefault(); insertImageFile(img); }
+    };
+    ed.addEventListener("dragover", function (e) { if (hasDroppableImage(e.dataTransfer)) { e.preventDefault(); } });
+    ed.addEventListener("drop", onDrop);
+  }
+
+  /* ---------------- 导入 .md ----------------
+   * 入口只有一个：工具栏「更多 → 导入 .md」，在弹框里选「文件」或「文件夹」。
+   * （历史上还支持把 .md 拖进编辑器 / 拖到左侧目录树，但沙箱里 HTML5 拖放拿不到
+   *  dataTransfer.files，实际做不到 —— 已整体下线，别再写回文档或代码里。） */
+
+  /** 打开「导入 .md」的选择器：先问一句是选文件还是选整个文件夹。
+   *  取元素一律用安全写法（先赋值再判空），元素缺失时给提示而不是抛错连坐整页。 */
   function pickImportFiles() {
-    var fi = $("file-input");
-    if (fi) { fi.click(); } else { toast("导入功能已停用", "warn"); }
+    openModal(function (card) {
+      var h = document.createElement("h3");
+      h.textContent = "导入 Markdown 笔记";
+      card.appendChild(h);
+      var p = document.createElement("p");
+      p.className = "m-msg";
+      p.textContent = "支持 .md / .markdown / .txt。选文件夹会保留里面的目录结构导入到存储目录。";
+      card.appendChild(p);
+      modalButtons(card, [
+        { text: "选择文件…", onClick: function () { closeModal(); clickInput("file-input"); } },
+        { text: "选择文件夹…", primary: true, onClick: function () { closeModal(); clickInput("dir-input"); } },
+        { text: "取消", onClick: function () { closeModal(); } }
+      ]);
+    });
+  }
+
+  /** 安全地触发一个隐藏 input（元素缺失不该让调用方崩） */
+  function clickInput(id) {
+    var el = $(id);
+    if (el) { el.click(); } else { toast("这个导入入口不可用（元素缺失）", "warn"); }
+  }
+
+  function importRelPath(f) {
+    // webkitRelativePath 形如 "笔记/子目录/a.md"；普通多选只有文件名
+    return String((f && f.webkitRelativePath) || (f && f.name) || "");
+  }
+
+  /** 从 FileList 里挑出 Markdown（选文件夹时会把目录下所有文件都送上来） */
+  function mdFilesOnly(files) {
+    var out = [];
+    var list = files || [];
+    for (var i = 0; i < list.length; i++) {
+      var f = list[i];
+      var name = String(f.name || "");
+      // 跳过隐藏文件与 macOS 的 __MACOSX / ._ 伴生文件
+      if (!/\.(md|markdown|txt)$/i.test(name)) { continue; }
+      if (/^\./.test(name) || /(^|\/)__MACOSX\//.test(importRelPath(f))) { continue; }
+      out.push(f);
+    }
+    return out;
+  }
+
+  function importTitleFrom(text, name) {
+    var m = /^\s*#\s+(.+)$/m.exec(String(text || ""));
+    if (m && m[1].trim()) { return m[1].trim().slice(0, 80); }
+    return stripExt(name);
+  }
+
+  /** 按名字找/建子文件夹（导入时按相对路径重建目录用） */
+  function ensureFolder(name, parentId) {
+    var hit = childrenOf(parentId).filter(function (n) {
+      return n.type === "folder" && String(n.name).toLowerCase() === String(name).toLowerCase();
+    })[0];
+    return hit || createFolder(name, parentId);
+  }
+
+  /**
+   * 打开导入弹框。files 是 File 数组（由文件/文件夹选择器给出）。
+   * 选项：目标文件夹、同名笔记怎么办（跳过/自动改名/覆盖）、每个文件的标题（取首个 H1，可改）。
+   */
+  function openImportModal(files) {
+    var list = Array.prototype.slice.call(files || []);
+    if (!list.length) { return; }
+    var items = [];
+    var pending = list.length;
+    list.forEach(function (f) {
+      S.readFileAsText(f).then(function (txt) {
+        items.push({ rel: importRelPath(f), title: importTitleFrom(txt, f.name), text: txt, ok: true });
+      }).catch(function () {
+        items.push({ rel: importRelPath(f), title: stripExt(f.name), text: "", ok: false });
+      }).then(function () {
+        if (--pending === 0) { build(); }
+      });
+    });
+
+    function build() {
+      var good = items.filter(function (x) { return x.ok; });
+      if (!good.length) { toast("没有可导入的 .md 文件（读不出来）", "warn"); return; }
+      var policy = "skip";
+      var titleInputs = [];
+      var sel = null;
+
+      openModal(function (card) {
+        var h = document.createElement("h3");
+        h.textContent = "导入 .md 文件";
+        card.appendChild(h);
+        var p = document.createElement("p");
+        p.className = "m-msg";
+        p.textContent = "共 " + good.length + " 个文件" +
+          (good.some(function (x) { return x.rel.indexOf("/") >= 0; }) ? "，会按相对路径重建目录结构" : "") + "。";
+        card.appendChild(p);
+
+        var lab = document.createElement("label");
+        lab.className = "m-label";
+        lab.textContent = "导入到";
+        card.appendChild(lab);
+        sel = document.createElement("select");
+        sel.className = "m-input";
+        folderOptions(null).forEach(function (o) {
+          var op = document.createElement("option");
+          op.value = o.id;
+          op.textContent = o.label;
+          if (o.id === (targetFolderId() || "")) { op.selected = true; }
+          sel.appendChild(op);
+        });
+        card.appendChild(sel);
+
+        var lab2 = document.createElement("label");
+        lab2.className = "m-label";
+        lab2.textContent = "同名笔记";
+        card.appendChild(lab2);
+        var radios = document.createElement("div");
+        radios.className = "import-radios";
+        [["skip", "跳过（保留现有）"], ["rename", "自动改名"], ["overwrite", "覆盖内容"]].forEach(function (r) {
+          var lb = document.createElement("label");
+          lb.className = "m-radio";
+          var rd = document.createElement("input");
+          rd.type = "radio";
+          rd.name = "import-policy";
+          rd.value = r[0];
+          if (r[0] === "skip") { rd.checked = true; }
+          rd.onchange = function () { policy = r[0]; };
+          lb.appendChild(rd);
+          var sp = document.createElement("span");
+          sp.textContent = r[1];
+          lb.appendChild(sp);
+          radios.appendChild(lb);
+        });
+        card.appendChild(radios);
+
+        var lab3 = document.createElement("label");
+        lab3.className = "m-label";
+        lab3.textContent = "标题（默认取首个一级标题，可改）";
+        card.appendChild(lab3);
+        var box = document.createElement("div");
+        box.className = "import-list";
+        good.forEach(function (it) {
+          var row = document.createElement("div");
+          row.className = "import-row";
+          var inp = document.createElement("input");
+          inp.className = "m-input";
+          inp.value = it.title;
+          titleInputs.push({ it: it, el: inp });
+          row.appendChild(inp);
+          if (it.rel.indexOf("/") >= 0) {
+            var rel = document.createElement("span");
+            rel.className = "import-rel";
+            rel.textContent = it.rel;
+            row.appendChild(rel);
+          }
+          box.appendChild(row);
+        });
+        card.appendChild(box);
+
+        modalButtons(card, [
+          { text: "取消", onClick: function () { closeModal(); } },
+          { text: "开始导入", primary: true, onClick: runImport }
+        ]);
+      });
+
+      function runImport() {
+        titleInputs.forEach(function (x) { x.it.title = String(x.el.value || "").trim() || x.it.title; });
+        var rootId = sel.value || null;
+        var made = 0, skipped = 0, overwritten = 0, renamed = 0;
+        good.forEach(function (it) {
+          // 目录部分按相对路径重建："a/b.md" → 文件夹 a 下的笔记 b
+          var parts = it.rel.split("/");
+          parts.pop();
+          var pid = rootId;
+          parts.filter(function (x) { return x && x !== "."; }).forEach(function (seg) {
+            pid = ensureFolder(seg, pid).id;
+          });
+
+          var dup = childrenOf(pid).filter(function (n) {
+            return n.type === "note" && String(n.name).toLowerCase() === String(it.title).toLowerCase();
+          })[0];
+          if (dup) {
+            if (policy === "skip") { skipped++; return; }
+            if (policy === "overwrite") {
+              dup.content = it.text;
+              dup.updatedAt = nowISO();
+              // 正文没读上来过的笔记，快照会省略 content —— 覆盖必须清掉这个标记，否则写了也不落盘
+              delete state.contentMissing[dup.id];
+              overwritten++;
+              return;
+            }
+            importCreateNote(it.title, pid, it.text);   // uniqueName 会自动加 (2)(3)
+            renamed++;
+            return;
+          }
+          importCreateNote(it.title, pid, it.text);
+          made++;
+        });
+        persist(false);
+        render();
+        closeModal();
+        var bits = ["已导入 " + made];
+        if (overwritten) { bits.push("覆盖 " + overwritten); }
+        if (renamed) { bits.push("改名 " + renamed); }
+        if (skipped) { bits.push("跳过 " + skipped); }
+        toast(bits.join(" · "));
+      }
+    }
+  }
+
+  /** 批量导入用的建笔记：只改内存，不做 persist/render（最后由调用方一次做完，避免 O(n²) 次全库保存） */
+  function importCreateNote(title, pid, text) {
+    state.nodes.push({
+      id: uid(), type: "note", name: uniqueName(pid, title || "未命名笔记"),
+      parentId: pid || null, content: text == null ? "" : text,
+      createdAt: nowISO(), updatedAt: nowISO()
+    });
   }
 
   function handleImport(files) {
-    if (!files || !files.length) { return; }
-    var parentId = targetFolderId();
-    var list = Array.prototype.slice.call(files);
-    Promise.all(list.map(function (f) {
-      return S.readFileAsText(f).then(function (txt) { return { name: stripExt(f.name), text: txt }; })
-        .catch(function () { return null; });
-    })).then(function (items) {
-      var n = 0;
-      items.forEach(function (it) {
-        if (!it) { return; }
-        createNote(it.name, parentId, it.text);
-        n++;
-      });
-      toast(n ? ("已导入 " + n + " 条笔记") : "没有可导入的 .md 文件", n ? "" : "warn");
-    });
+    openImportModal(files);
   }
   function copyText(text, what) {
     function fallback() {
@@ -2537,7 +2940,7 @@
     // 否则整个 bindEvents 会在此处中断（2026-09-21 实际事故：所有按钮点不动 + 笔记从不落盘）。
     click("btn-copy-sql", copySqlToDbx, true);
     click("btn-export-md", function () { exportNote(activeNote()); });
-    // 导入功能暂时下线（ENABLE_IMPORT=false）：入口与绑定一起摘掉，避免出现点了没反应的按钮。
+    // 导入（v0.8.7 恢复）：入口在「更多」菜单里，绑定与元素同在，不会出现点了没反应的按钮
     if (ENABLE_IMPORT) { click("btn-import-md", pickImportFiles); }
     click("btn-backup-zip", backupAll);
     click("btn-restore-zip", restoreFlow);
@@ -2554,6 +2957,14 @@
         handleImport(e.target.files);
         e.target.value = "";
       });
+      // 选文件夹（webkitdirectory）：会把该目录下**所有**文件都送上来，这里只留 Markdown，
+      // 并把非 md 的（图片、.DS_Store 等）挡掉，避免弹框里塞一堆无关条目。
+      on("dir-input", "onchange", function (e) {
+        handleImport(mdFilesOnly(e.target.files));
+        e.target.value = "";
+      });
+      // 编辑器里粘贴 / 拖入图片（只处理图片；.md 的拖放导入已下线，见 bindEditorImageCapture）
+      bindEditorImageCapture();
     }
 
     on("backup-input", "onchange", function (e) {

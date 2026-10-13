@@ -22,8 +22,17 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import { spawn } from "node:child_process";
+import zlib from "node:zlib";
 import { createRequire } from "node:module";
-import { removeTree } from "./_testutil.mjs";
+/**
+ * 删除测试临时目录 —— 直接 fs.rmSync，就这一行。
+ * 本机沙箱对「逐个文件删除」有接管：unlinkSync/rmdirSync 循环几百个文件就卡死十几分钟，
+ * cmd rd 反而比 fs.rmSync 慢一个数量级（实测 300 个小文件：rmSync 3.7s / cmd 41s）。
+ * 别再加 spawnSync（对任何 exe 直接 EBUSY）或逐文件循环。
+ */
+function removeTree(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 清理失败不该让用例失败 */ }
+}
 
 const NODE_WS = "C:/Users/Luke-pc/.workbuddy/binaries/node/workspace/package.json";
 const require = createRequire(NODE_WS);
@@ -38,7 +47,7 @@ const SAVED_DIR = path.join(TMP, "saved");   // 模拟「用户在原生另存�
 const BRIDGE_PAYLOAD_LIMIT = 2 * 1024 * 1024;
 const CONN_ID = "e2e-ui-conn-1";
 
-removeTree(TMP);   // 见 _testutil.mjs：沙箱把 rmSync 接管成回收站，目录一大就超时
+removeTree(TMP);   // 见本文件内的 removeTree
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SAVED_DIR, { recursive: true });
@@ -73,6 +82,36 @@ function zipEntries(buf) {
     const extraLen = buf.readUInt16LE(off + 30);
     const commentLen = buf.readUInt16LE(off + 32);
     out.push(buf.slice(off + 46, off + 46 + nameLen).toString("utf8"));
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
+/** 解出 zip 里每个条目的字节（自己生成的包，只处理 deflate/store） */
+function zipContents(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i >= buf.length - 22 - 65536; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("不是 zip：找不到 EOCD");
+  const count = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const out = new Map();
+  for (let i = 0; i < count; i++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error("中央目录签名不对 @" + off);
+    const method = buf.readUInt16LE(off + 10);
+    const compSize = buf.readUInt32LE(off + 20);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    const lho = buf.readUInt32LE(off + 42);
+    const name = buf.slice(off + 46, off + 46 + nameLen).toString("utf8");
+    // 本地头里的名称/扩展字段长度可能与中央目录不同 —— 必须按本地头再算一次数据起点
+    const lnl = buf.readUInt16LE(lho + 26);
+    const lel = buf.readUInt16LE(lho + 28);
+    const start = lho + 30 + lnl + lel;
+    const raw = buf.slice(start, start + compSize);
+    out.set(name, method === 8 ? zlib.inflateRawSync(raw) : raw);
     off += 46 + nameLen + extraLen + commentLen;
   }
   return out;
@@ -183,6 +222,13 @@ function installBridge(window) {
   // jsdom 缺失的浏览器 API 兜底
   window.Element.prototype.scrollIntoView = function () {};
   window.document.execCommand = () => false;
+  // jsdom 没实现 createObjectURL / revokeObjectURL（真实宿主里是浏览器原生的）。
+  // 补一个最小可用的：让「侧车取字节 → 包成 blob: → 赋给 img.src」这条真实路径能被断言到。
+  if (!window.URL.createObjectURL) {
+    let blobN = 0;
+    window.URL.createObjectURL = () => "blob:jsdom/" + (++blobN);
+    window.URL.revokeObjectURL = () => {};
+  }
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   window.__hostLog = hostLog;
   window.__saveCalls = saveCalls;
@@ -523,6 +569,9 @@ if (bkCall && fs.existsSync(bkCall.path)) {
     $("modal").hidden === false && $("modal").textContent.includes("确认恢复")
       && $("modal").textContent.includes("篇笔记"),
     $("modal").textContent.slice(0, 120) || "（没有弹窗）");
+  check("恢复确认框也报图片数量（备份是否完整一眼可见）",
+    /张图片/.test($("modal").textContent),
+    ($("modal").textContent.match(/包含：[^\n]*/) || ["（找不到包含行）"])[0]);
 
   const startBtn = [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "开始恢复");
   check("确认框有「开始恢复」按钮", !!startBtn);
@@ -906,6 +955,259 @@ if (bkCall && fs.existsSync(bkCall.path)) {
     }
   }
   modelSrv.close();
+}
+
+/* ---------- 16) 导入 .md（v0.8.7 恢复并增强） ---------- */
+{
+  const menu = $("more-menu");
+  const btn = $("btn-import-md");
+  check("「更多」菜单里有「导入 .md」", !!btn && !!menu && menu.contains(btn));
+  check("两个导入选择器都在（选文件 / 选文件夹）", !!$("file-input") && !!$("dir-input"));
+  check("「选文件夹」用 webkitdirectory（才能拿到相对路径）",
+    !!$("dir-input") && $("dir-input").hasAttribute("webkitdirectory"));
+
+  // 点入口先问一句「选文件还是选文件夹」
+  btn.click();
+  await sleep(60);
+  const m = $("modal");
+  check("点「导入 .md」先弹出选择方式",
+    m.hidden === false && /导入 Markdown 笔记/.test(m.textContent), m.textContent.slice(0, 50));
+  check("选择方式里有「选择文件…」与「选择文件夹…」",
+    ["选择文件…", "选择文件夹…"].every((t) =>
+      [...m.querySelectorAll("button")].some((b) => b.textContent === t)),
+    [...m.querySelectorAll("button")].map((b) => b.textContent).join(" | "));
+  // 不该再承诺「拖到目录树/编辑器」—— 沙箱里 HTML5 拖放拿不到 dataTransfer.files，做不到的事不要写
+  check("导入说明里不再承诺拖放导入（做不到的事不写）",
+    !/拖到|拖动|拖拽|拖进/.test(m.textContent), m.textContent.slice(0, 90));
+  const cancelBtn = [...m.querySelectorAll("button")].find((b) => b.textContent === "取消");
+  cancelBtn.click();
+  await sleep(30);
+  check("点「取消」关掉弹框", $("modal").hidden === true);
+
+  // jsdom 里点隐藏 input 不会弹系统选择框，所以直接喂 FileList（等价于用户选完文件）
+  const mkFile = (name, text, rel) => {
+    const f = new window.File([text], name, { type: "text/markdown" });
+    Object.defineProperty(f, "webkitRelativePath", { value: rel || "" });
+    return f;
+  };
+  const fRoot = mkFile("读书笔记.md", "# 读书笔记\n\n第一条。", "读书笔记.md");
+  const fA = mkFile("a.md", "# 子目录笔记 A\n\nA 的正文。", "我的笔记/子目录/a.md");
+  const fB = mkFile("b.md", "这篇没有一级标题。", "我的笔记/子目录/b.md");
+  const fi = $("file-input");
+  Object.defineProperty(fi, "files", { value: [fRoot, fA, fB], configurable: true });
+  fi.dispatchEvent(new window.Event("change"));
+  await waitFor(() => $("modal").hidden === false && /导入 \.md 文件/.test($("modal").textContent),
+    4000, "导入弹框");
+
+  const im = $("modal");
+  check("导入弹框统计了文件数", /共 3 个文件/.test(im.textContent), im.textContent.slice(0, 60));
+  check("导入弹框提示会按相对路径重建目录", /重建目录结构/.test(im.textContent));
+  check("导入弹框有目标文件夹选择", !!im.querySelector("select"));
+  check("导入弹框有三种冲突策略（跳过 / 自动改名 / 覆盖）",
+    ["跳过（保留现有）", "自动改名", "覆盖内容"].every((t) => im.textContent.indexOf(t) >= 0));
+  const titles = [...im.querySelectorAll(".import-row input")].map((i) => i.value);
+  check("每个文件一行标题，默认取首个一级标题（没有则用文件名）",
+    titles.length === 3 && titles[0] === "读书笔记" && titles[1] === "子目录笔记 A" && titles[2] === "b",
+    titles.join(" | "));
+  check("嵌套文件的相对路径有展示出来",
+    [...im.querySelectorAll(".import-rel")].some((e) => e.textContent.indexOf("我的笔记/子目录/a.md") >= 0),
+    [...im.querySelectorAll(".import-rel")].map((e) => e.textContent).join(" | ") || "（无）");
+
+  // 选「自动改名」→ 开始导入
+  const renameRadio = [...im.querySelectorAll('input[name="import-policy"]')]
+    .find((r) => r.value === "rename");
+  renameRadio.checked = true;
+  renameRadio.dispatchEvent(new window.Event("change"));
+  [...im.querySelectorAll("button")].find((b) => b.textContent === "开始导入").click();
+  await waitFor(() => $("modal").hidden === true, 4000, "导入完成");
+  await sleep(600);   // 等 persist 真的落到侧车
+
+  const names = [...doc.querySelectorAll("#tree .node")].map((e) => e.textContent);
+  check("根级笔记已导入", names.some((t) => /读书笔记/.test(t)), names.join(" | "));
+  check("嵌套目录被重建（我的笔记 / 子目录）",
+    names.some((t) => /我的笔记/.test(t)) && names.some((t) => /子目录/.test(t)), names.join(" | "));
+
+  // 关键：磁盘上真的有这些 .md（不是只在内存里）
+  const walkAll = (d) => {
+    const out = [];
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) out.push(...walkAll(p)); else out.push(p);
+    }
+    return out;
+  };
+  const diskFiles = walkAll(STORAGE_DIR);
+  const rels = diskFiles.map((p) => path.relative(STORAGE_DIR, p).split(path.sep).join("/"));
+  check("导入的 .md 真的落盘了", rels.some((p) => /读书笔记\.md$/.test(p)), rels.join(" | "));
+  check("嵌套目录也在磁盘上重建了",
+    rels.some((p) => /我的笔记\/子目录\/(a|b)\.md$/.test(p)), rels.join(" | "));
+}
+
+/* ---------- 17) 粘贴图片 → 落盘 assets/ → 预览显示 ---------- */
+{
+  // 渲染器先过一遍纯函数断言（快、稳）
+  const md = window.MDNotes && window.MDNotes.renderMarkdown;
+  check("渲染器把 assets/ 相对路径渲染成 img 占位",
+    typeof md === "function" && /<img class="md-img" data-src="assets\/x\.png"/.test(md("![](assets/x.png)")));
+  check("外链图片降级成文字提示（沙箱 CSP 加载不了，别留破图）",
+    /md-img-ext/.test(md("![](https://example.com/a.png)")) && !/<img/.test(md("![](https://example.com/a.png)")));
+
+  const note = [...doc.querySelectorAll("#tree .node")]
+    .find((el) => el.getAttribute("data-type") === "note");
+  check("图片用例：目录树里有笔记可选中", !!note);
+  if (note) {
+    note.click();
+    await sleep(80);
+    const ed = $("editor");
+    const beforeVal = String(ed.value || "");
+    ed.selectionStart = beforeVal.length;
+    ed.selectionEnd = beforeVal.length;
+
+    // 1×1 PNG：小到不会走 canvas 压缩（IMG_SMALL 以内），字节可逐字比对
+    const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+    const pngBytes = Buffer.from(pngB64, "base64");
+    const file = new window.File([pngBytes], "shot.png", { type: "image/png" });
+
+    // 模拟粘贴：clipboardData.items 里躺着一个 image/png
+    const ev = new window.Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", {
+      value: { items: [{ kind: "file", type: "image/png", getAsFile: () => file }] },
+    });
+    ed.dispatchEvent(ev);
+
+    const inserted = await waitFor(
+      () => /!\[[^\]]*\]\(assets\/[^)]+\.png\)/.test(String(ed.value || "")), 8000, "图片插入正文");
+    const mRel = /\(((?:assets\/)[^)]+\.png)\)/.exec(String(ed.value || ""));
+    const rel = mRel ? mRel[1] : "";
+    check("粘贴图片会在光标处插入 Markdown 引用", inserted, rel || "（没插入）");
+    check("默认粘贴被拦下（不会把一大串 data: URL 塞进正文）",
+      String(ed.value || "").indexOf("data:image") < 0);
+    check("原正文没被覆盖（新内容追加在末尾）",
+      beforeVal === "" || String(ed.value || "").indexOf(beforeVal) === 0);
+
+    await sleep(500);
+    const assetPath = rel ? path.join(STORAGE_DIR, rel.split("/").join(path.sep)) : "";
+    check("图片字节真的写进了 <存储目录>/assets/",
+      rel !== "" && fs.existsSync(assetPath),
+      rel ? path.relative(STORAGE_DIR, assetPath) : "（没拿到相对路径）");
+    if (assetPath && fs.existsSync(assetPath)) {
+      // 图片是二进制：写入必须是精确字节（base64 解码错了会悄悄坏图）
+      check("落盘内容与原始 PNG 逐字节一致（base64 往返没错）",
+        fs.readFileSync(assetPath).equals(pngBytes),
+        fs.statSync(assetPath).size + "B vs " + pngBytes.length + "B");
+    }
+
+    const gotImg = await waitFor(() => !!doc.querySelector("#preview img.md-img"), 6000, "预览图片");
+    const img = doc.querySelector("#preview img.md-img");
+    check("预览把占位换成真图片（src=blob:）",
+      gotImg && !!img && /^blob:/.test(img.src || ""), img ? img.src : "（无 img）");
+    check("换完之后不再残留 data-src（否则样式会当它是占位）",
+      !!img && !img.hasAttribute("data-src"));
+
+    // 文件不在 → 降级成可点击占位，而不是破图
+    ed.value = "![丢了](assets/nope-does-not-exist.png)";
+    ed.dispatchEvent(new window.Event("input", { bubbles: true }));
+    const fell = await waitFor(() => !!doc.querySelector("#preview .md-img-missing"), 6000, "缺图降级");
+    check("图片缺失时降级成可点击占位（不留破图）", fell,
+      (doc.querySelector("#preview").textContent || "").slice(0, 60));
+  }
+}
+
+/* ---------- 18) 备份必须带上图片目录（assets/），恢复要能还原 ---------- */
+{
+  // 前置：第 17 节已经粘贴过一张图，磁盘上应该有 <storage>/assets/*.png
+  const assetsDir = path.join(STORAGE_DIR, "assets");
+  const diskAssets = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];
+  check("前置条件：assets/ 里已有一张粘贴进来的图", diskAssets.length > 0, diskAssets.join(" | "));
+
+  // 走 UI：更多 → 备份 zip（宿主「另存为」把字节交给 saveCalls）
+  $("btn-more").click();
+  await sleep(30);
+  $("btn-backup-zip").click();
+  await sleep(1200);
+
+  const zipCall = saveCalls.filter((c) => c.contentType === "application/zip").pop();
+  check("备份走的是宿主另存为", !!zipCall && fs.existsSync(zipCall.path),
+    zipCall ? zipCall.path : "（没有调用）");
+
+  let entries = new Map();
+  if (zipCall && fs.existsSync(zipCall.path)) {
+    entries = zipContents(fs.readFileSync(zipCall.path));
+  }
+
+  const assetEntries = [...entries.keys()].filter((n) => n.startsWith("assets/"));
+  check("备份包里带上了 assets/ 图片目录",
+    assetEntries.length >= diskAssets.length,
+    "包内 assets 条目=" + (assetEntries.join(", ") || "（一个都没有）")
+      + " · 磁盘上=" + diskAssets.join(", "));
+
+  // 逐字节比对：图片是二进制，写进去时被截断/转码都会悄悄坏掉
+  let same = 0, diff = [];
+  for (const name of diskAssets) {
+    const inZip = entries.get("assets/" + name);
+    const onDisk = fs.readFileSync(path.join(assetsDir, name));
+    if (inZip && inZip.equals(onDisk)) { same++; } else { diff.push(name); }
+  }
+  check("包内图片与磁盘上的图片逐字节一致",
+    diskAssets.length > 0 && diff.length === 0,
+    same + "/" + diskAssets.length + " 一致" + (diff.length ? "，不一致：" + diff.join(",") : ""));
+
+  // 备份成功弹窗要报出图片数量（否则用户从包外无法判断备份是否完整）
+  check("备份成功弹窗报出图片数量",
+    $("modal").hidden === false && /张图片/.test($("modal").textContent),
+    ($("modal").textContent.match(/包含：[^\n]*/) || ["（没有弹窗）"])[0]);
+  const closeBk = [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "关闭");
+  if (closeBk) { closeBk.click(); await sleep(100); }
+
+  // ---- 恢复要把图片放回来：先把 assets/ 整个删掉，再从上面那份包恢复 ----
+  if (zipCall && diskAssets.length > 0) {
+    const zipBuf = fs.readFileSync(zipCall.path);
+    fs.rmSync(assetsDir, { recursive: true, force: true });
+    check("现场已破坏（assets/ 被整个删掉）", !fs.existsSync(assetsDir));
+
+    const zipFile = new window.File([new Uint8Array(zipBuf)], path.basename(zipCall.path),
+      { type: "application/zip" });
+    const input = $("backup-input");
+    Object.defineProperty(input, "files", { value: [zipFile], configurable: true });
+    fire(input, "change");
+    await waitFor(() => $("modal").hidden === false && /确认恢复/.test($("modal").textContent),
+      8000, "恢复确认框");
+    const goBtn = [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "开始恢复");
+    check("恢复确认框里能看到「将一并恢复图片」",
+      /张图片|一并恢复/.test($("modal").textContent),
+      $("modal").textContent.slice(0, 120));
+    if (!goBtn) { console.log("  （没找到「开始恢复」按钮，跳过恢复断言）"); }
+    else {
+      goBtn.click();
+      await waitFor(() => $("modal").hidden === false && /恢复完成/.test($("modal").textContent),
+        10000, "恢复完成");
+      check("恢复完成并回报了图片数量",
+        /张图片/.test($("modal").textContent), $("modal").textContent.slice(0, 100));
+
+      const back = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];
+      check("恢复后 assets/ 里的图片回来了", back.length >= diskAssets.length,
+        "恢复后=" + (back.join(", ") || "（空）") + " · 原来=" + diskAssets.join(", "));
+      let ok = 0;
+      for (const name of diskAssets) {
+        const p = path.join(assetsDir, name);
+        if (fs.existsSync(p) && entries.get("assets/" + name).equals(fs.readFileSync(p))) { ok++; }
+      }
+      check("恢复回来的图片逐字节一致", ok === diskAssets.length, ok + "/" + diskAssets.length);
+
+      // 正文里的引用要还能解析到图（否则预览会显示「图片缺失」）
+      const note = [...doc.querySelectorAll("#tree .node")].find((el) => el.getAttribute("data-type") === "note");
+      if (note) {
+        note.click();
+        await sleep(600);
+        const missing = doc.querySelectorAll("#preview .md-img-missing").length;
+        const shown = doc.querySelectorAll("#preview img.md-img").length;
+        check("恢复后预览里没有「图片缺失」占位", missing === 0,
+          "缺失占位=" + missing + " · 正常图片=" + shown);
+      }
+      const closeBtn = [...$("modal").querySelectorAll("button")].find((b) => b.textContent === "关闭");
+      if (closeBtn) { closeBtn.click(); await sleep(100); }
+    }
+  }
 }
 
 /* ---------- 汇总 ---------- */

@@ -110,7 +110,7 @@ if (badRefs.length) {
 // (b) 关键 UI 节点必须在 index.html 里真实存在
 const CRITICAL = ["main", "store-status", "store-text", "tree", "editor", "title",
   "ai-panel", "aip-scroll", "aip-log", "aip-go", "aip-target", "aip-mode-none",
-  "aip-view-chat", "aip-view-create", "ai-cfg-modal", "aic-save", "gutter-side", "gutter-ai",
+  "aip-view-chat", "aip-view-create", "ai-cfg-modal", "aic-save", "file-input", "dir-input", "gutter-side", "gutter-ai",
   "btn-insert-sql", "btn-ai", "btn-more", "more-menu", "btn-export-md", "btn-restore-zip"];
 const missingCritical = CRITICAL.filter(id => !liveIds.has(id));
 if (missingCritical.length) {
@@ -160,12 +160,13 @@ if (!enableImport) {
 }
 const importBtnLive = liveIds.has("btn-import-md");
 const importInputLive = liveIds.has("file-input");
-if (enableImport[1] === "false" && (importBtnLive || importInputLive)) {
-  console.error("\n[FATAL] ENABLE_IMPORT=false 但 index.html 里 #btn-import-md 或 #file-input 仍存在：请一并注释掉。\n");
+const importDirLive = liveIds.has("dir-input");   // 「选文件夹」用的 webkitdirectory input
+if (enableImport[1] === "false" && (importBtnLive || importInputLive || importDirLive)) {
+  console.error("\n[FATAL] ENABLE_IMPORT=false 但 index.html 里 #btn-import-md / #file-input / #dir-input 仍存在：请一并注释掉。\n");
   process.exit(1);
 }
-if (enableImport[1] === "true" && !(importBtnLive && importInputLive)) {
-  console.error("\n[FATAL] ENABLE_IMPORT=true 但 index.html 里 #btn-import-md / #file-input 被注释：请一并放开。\n");
+if (enableImport[1] === "true" && !(importBtnLive && importInputLive && importDirLive)) {
+  console.error("\n[FATAL] ENABLE_IMPORT=true 但 index.html 里 #btn-import-md / #file-input / #dir-input 被注释：请一并放开。\n");
   process.exit(1);
 }
 

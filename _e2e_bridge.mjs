@@ -12,10 +12,92 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { spawn } from "node:child_process";
-import { removeTree } from "./_testutil.mjs";
+/**
+ * 删除测试临时目录 —— 直接 fs.rmSync，就这一行。
+ * 本机沙箱对「逐个文件删除」有接管：unlinkSync/rmdirSync 循环几百个文件就卡死十几分钟，
+ * cmd rd 反而比 fs.rmSync 慢一个数量级（实测 300 个小文件：rmSync 3.7s / cmd 41s）。
+ * 别再加 spawnSync（对任何 exe 直接 EBUSY）或逐文件循环。
+ */
+function removeTree(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 清理失败不该让用例失败 */ }
+}
 
 const ROOT = "D:/core/web/dbx-pj/dbx-md-notes";
-const HOST_SRC = "C:/Users/Luke-pc/AppData/Local/Temp/opencode/dbx-src/dbx-main/apps/desktop/src/lib/plugins/pluginHostBridge.ts";
+// 宿主源码里放着官方 SDK 的 JS 源串（pluginSdkSource）。可用 DBX_HOST_SRC 覆盖；
+// 文件不存在时退化成本文件尾部的等价 SDK 桩（wire 协议一致，接口是 storage.js 用到的子集）。
+const HOST_SRC = process.env.DBX_HOST_SRC || "C:/Users/Luke-pc/AppData/Local/Temp/opencode/dbx-src/dbx-main/apps/desktop/src/lib/plugins/pluginHostBridge.ts";
+
+/* ------------------------------------------------------------------
+ * 等价 SDK 桩：本地没有宿主源码时用它，桥接层测试才不至于整体跑不了。
+ *
+ * wire 协议与官方 SDK 一致（storage.js 只依赖这些）：
+ *   - 加载后向 parent.postMessage({type:"ready"})
+ *   - 宿主回 {source:"dbx-host", type:"init", context, locale, capabilities}
+ *   - 调用方 postMessage({type:"request", id, method, params})
+ *   - 宿主回 {source:"dbx-host", type:"response", id, result|error}
+ * invoke() → 宿主方法 backend.invoke（映射到侧车）；request() → 直接走宿主方法。
+ * 接口是 storage.js 实际用到的子集：
+ *   ready / context / locale / theme / capabilities / notify / invoke / request / onContext / onInit
+ * ------------------------------------------------------------------ */
+const FALLBACK_SDK_SOURCE = [
+  "(function () {",
+  "  var pending = new Map(), seq = 0, initListeners = [], ctxListeners = [];",
+  "  var initResolve, currentContext = {};",
+  "  var ready = new Promise(function (res) { initResolve = res; });",
+  "  function post(msg) { parent.postMessage(msg); }",
+  "  function call(method, params) {",
+  "    var id = String(++seq);",
+  "    return new Promise(function (resolve, reject) {",
+  "      pending.set(id, { resolve: resolve, reject: reject });",
+  "      post({ type: 'request', id: id, method: method, params: params === undefined ? null : params });",
+  "    });",
+  "  }",
+  "",
+  "  // 宿主侧二进制走消息上的 data 字段（与官方 SDK 的 transfer 语义对应）",
+  "  function callBytes(method, params, bytes) {",
+  "    var id = String(++seq);",
+  "    return new Promise(function (resolve, reject) {",
+  "      pending.set(id, { resolve: resolve, reject: reject });",
+  "      post({ type: 'request', id: id, method: method, params: params || {}, data: bytes === undefined ? null : bytes });",
+  "    });",
+  "  }",
+  "  window.addEventListener('message', function (ev) {",
+  "    var m = ev.data || {};",
+  "    if (m.source !== 'dbx-host') { return; }",
+  "    if (m.type === 'init') {",
+  "      currentContext = m.context || {};",
+  "      try { window.dbxPlugin.locale = m.locale || 'zh-CN'; } catch (e) {}",
+  "      initResolve(currentContext);",
+  "      initListeners.slice().forEach(function (fn) { try { fn(currentContext); } catch (e) {} });",
+  "      return;",
+  "    }",
+  "    if (m.type === 'response') {",
+  "      var e = pending.get(String(m.id));",
+  "      if (e) {",
+  "        pending.delete(String(m.id));",
+  "        if (m.error) { e.reject(new Error((m.error && m.error.message) || String(m.error))); }",
+  "        else { e.resolve(m.result); }",
+  "      }",
+  "    }",
+  "  });",
+  "  window.dbxPlugin = {",
+  "    ready: ready,",
+  "    get context() { return currentContext; },",
+  "    locale: 'zh-CN',",
+  "    theme: null,",
+  "    capabilities: {},",
+  "    notify: function () {},",
+  "    // storage.js 用 typeof api.saveFile === 'function' 探测，缺了就走「宿主不支持」分支",
+  "    saveFile: function (opts, bytes) { return callBytes('host.saveFile', opts, bytes); },",
+  "    copy: function (text) { return call('host.copy', { text: String(text === undefined ? '' : text) }); },",
+  "    invoke: function (method, params) { return call('backend.invoke', { method: method, params: params === undefined ? null : params }); },",
+  "    request: function (method, params) { return call(method, params === undefined ? null : params); },",
+  "    onContext: function (fn) { ctxListeners.push(fn); return function () { var i = ctxListeners.indexOf(fn); if (i >= 0) { ctxListeners.splice(i, 1); } }; },",
+  "    onInit: function (fn) { initListeners.push(fn); return function () { var i = initListeners.indexOf(fn); if (i >= 0) { initListeners.splice(i, 1); } }; }",
+  "  };",
+  "  post({ type: 'ready' });",
+  "})();",
+].join("\n");
 const EXE = path.join(ROOT, "backend/dbx-plugin-mdnotes.exe");
 const TMP = path.join(ROOT, "_e2e_tmp");
 const STORAGE_DIR = path.join(TMP, "storage");
@@ -23,7 +105,7 @@ const DATA_DIR = path.join(TMP, "data");
 const SAVED_DIR = path.join(TMP, "saved");   // 模拟「用户在原生另存为对话框里选的目录」
 const BRIDGE_PAYLOAD_LIMIT = 2 * 1024 * 1024;
 
-removeTree(TMP);   // 见 _testutil.mjs：沙箱把 rmSync 接管成回收站，目录一大就超时
+removeTree(TMP);   // 见本文件内的 removeTree
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SAVED_DIR, { recursive: true });
@@ -59,6 +141,20 @@ function zipEntries(buf) {
 
 /* ---------- 1) 从宿主源码抽出官方 SDK 源串 ---------- */
 function extractSdkSource() {
+  if (fs.existsSync(HOST_SRC)) {
+    try {
+      return readOfficialSdkSource();
+    } catch (e) {
+      console.log("[bridge] 宿主源码在但解析失败（" + e.message + "）→ 改用等价 SDK 桩");
+    }
+  } else {
+    console.log("[bridge] 没找到本地宿主源码：" + HOST_SRC);
+    console.log("        → 用本文件尾部的等价 SDK 桩；想用官方 SDK 请设 DBX_HOST_SRC 指向 pluginHostBridge.ts");
+  }
+  return FALLBACK_SDK_SOURCE;
+}
+
+function readOfficialSdkSource() {
   const src = fs.readFileSync(HOST_SRC, "utf8");
   const fnAt = src.indexOf("export function pluginSdkSource");
   const start = src.indexOf("return `", fnAt) + "return `".length;
@@ -536,3 +632,4 @@ function check(name, cond, extra) {
   child.kill();
   process.exit(2);
 });
+

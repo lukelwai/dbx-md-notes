@@ -1097,6 +1097,70 @@ button.danger:hover { background: var(--danger-soft); }
 
 .markdown-body del { color: var(--fg-subtle); }
 
+/* ---------------- 正文里的图片 ----------------
+ * 沙箱没有磁盘/网络权限：本地图片的字节由侧车读出来，前端包成 blob: URL 显示。
+ * 取字节是异步的，「还没到的」与「文件丢了」都要有像样的占位，别留破图。
+ */
+.markdown-body img.md-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: .9em 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-sub);
+}
+/* 字节还没到（或取回中）：给一块最小占位，避免布局跳动 */
+.markdown-body img.md-img[data-src] {
+  min-width: 120px;
+  min-height: 64px;
+}
+.markdown-body .md-img-ext,
+.markdown-body .md-img-missing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: var(--bg-sub);
+  color: var(--fg-subtle);
+  font-size: 12.5px;
+}
+.markdown-body .md-img-missing { cursor: pointer; }
+.markdown-body .md-img-missing:hover { border-color: var(--warn); color: var(--warn); }
+
+/* ---------------- 导入 .md 弹框 ---------------- */
+.import-radios { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 2px 0 4px; }
+.m-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.import-list {
+  max-height: 220px;
+  overflow: auto;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-sub);
+}
+.import-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.import-row .m-input { flex: 1; min-width: 0; }
+.import-rel {
+  flex: none;
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--fg-subtle);
+}
+
 /* SQL 高亮配色 */
 .tok-kw { color: #cf222e; font-weight: 600; }
 .tok-str { color: #0a7d32; }

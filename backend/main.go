@@ -24,6 +24,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,7 +38,7 @@ import (
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
 	pluginID      = "com.lwai.mdnotes"
-	pluginVersion = "0.8.6" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginVersion = "0.8.8" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -202,6 +203,14 @@ func (plugin *plugin) Handle(
 		}
 		sidecarTrace(fmt.Sprintf("notes/save ok dir=%s bytes=%d", notesDir(), len(p.Data)))
 		return map[string]any{"ok": true, "path": metaPath(), "dir": notesDir()}, nil
+
+	case "notes/putAsset":
+		// 粘贴/拖入的图片：前端压缩后把字节交给侧车，落成 <storage_dir>/assets/<名字>。
+		return putAssetHandler(params)
+
+	case "notes/getAsset":
+		// 预览时按相对路径读回图片字节（只允许 assets/ 下的相对路径）。
+		return getAssetHandler(params)
 
 	case "notes/exportNote":
 		var p struct {
@@ -1121,11 +1130,16 @@ type backupInfo struct {
 	Scope      string `json:"scope,omitempty"`
 	Notes      int    `json:"notes"`
 	Folders    int    `json:"folders"`
-	MetaFile   string `json:"metaFile"`
+	// Assets：一并打包的图片数量。老备份包里没有这个字段 → 解出来是 0，
+	// 恢复端据此区分「这份包本来就没有图」与「这个版本开始才带图」。
+	Assets   int    `json:"assets"`
+	MetaFile string `json:"metaFile"`
 }
 
-// buildBackupZip 在内存里构造备份包。notes 是要打包的笔记节点，scope 为空表示整库。
-func buildBackupZip(root string, m Meta, notes []MetaNode, folders int, scope string) []byte {
+// buildBackupZip 在内存里构造备份包。notes 是要打包的笔记节点，scope 为空表示整库；
+// assets 是要一并打包的图片相对路径（正斜杠，相对 root）——**漏了它备份就是残缺的**：
+// 笔记正文引用的 ![](assets/x.png) 会全部变成「图片缺失」。
+func buildBackupZip(root string, m Meta, notes []MetaNode, folders int, scope string, assets []string) []byte {
 	var sb strings.Builder
 	zw := zip.NewWriter(&writerCapture{&sb})
 
@@ -1138,6 +1152,7 @@ func buildBackupZip(root string, m Meta, notes []MetaNode, folders int, scope st
 		Scope:      scope,
 		Notes:      len(notes),
 		Folders:    folders,
+		Assets:     len(assets),
 		MetaFile:   backupMetaEntry,
 	}
 	if b, e := json.MarshalIndent(info, "", "  "); e == nil {
@@ -1162,8 +1177,88 @@ func buildBackupZip(root string, m Meta, notes []MetaNode, folders int, scope st
 		}
 		_, _ = w.Write(data)
 	}
+	// 图片放在正文之后：这样先解出笔记、再解出图，中途失败也不会出现「图在但笔记没到」。
+	for _, rel := range assets {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			continue // 索引/正文引用了但文件已经不在了 —— 跳过，不让整包失败
+		}
+		w, e := zw.Create(rel)
+		if e != nil {
+			continue
+		}
+		_, _ = w.Write(data)
+	}
 	_ = zw.Close()
 	return []byte(sb.String())
+}
+
+// collectAssetFiles 递归收集 <root>/assets/ 下所有文件（返回正斜杠相对路径，已排序）。
+func collectAssetFiles(root, dir string) []string {
+	var out []string
+	var walk func(d string)
+	walk = func(d string) {
+		ents, err := os.ReadDir(d)
+		if err != nil {
+			return
+		}
+		for _, e := range ents {
+			p := filepath.Join(d, e.Name())
+			if e.IsDir() {
+				walk(p)
+				continue
+			}
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				continue
+			}
+			out = append(out, filepath.ToSlash(rel))
+		}
+	}
+	walk(dir)
+	sort.Strings(out) // 稳定顺序 → 同样的库备份两次得到同一份字节，便于校验
+	return out
+}
+
+// assetRefRe 抓正文里对本地图片的引用（`![](assets/x.png)` / `[说明](assets/x.png)`）。
+// 与前端 markdown.js 的图片规则保持一致：只认 assets/ 下的相对路径。
+var assetRefRe = regexp.MustCompile(`\]\(([^()\s]*assets/[A-Za-z0-9._\-/]+)\)`)
+
+/*
+assetsForNotes 决定这次备份要带哪些图片。
+
+  - all=true（整库备份 / 恢复前的安全快照）：`assets/` 下**全部**文件。
+    必须是全部 —— 「图片缺失」的另一半原因就是只按当前引用去凑，漏掉暂时没被引用但还在用的图。
+  - all=false（只备份某个文件夹/单篇）：只带**被这些笔记正文引用到**的图，
+    单篇导出不该把整个图片库塞进去（几百张截图会让 zip 从几十 KB 变成几十 MB）。
+*/
+func assetsForNotes(root string, notes []MetaNode, all bool) []string {
+	if all {
+		return collectAssetFiles(root, filepath.Join(root, assetsDirName))
+	}
+	set := map[string]bool{}
+	for _, n := range notes {
+		data, err := os.ReadFile(filepath.Join(root, n.File))
+		if err != nil {
+			continue
+		}
+		for _, m := range assetRefRe.FindAllStringSubmatch(string(data), -1) {
+			rel, err := safeAssetRel(m[1])
+			if err != nil {
+				continue
+			}
+			if st, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil || st.IsDir() {
+				continue
+			}
+			set[rel] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func backupFileName(m Meta, scope string) string {
@@ -1205,7 +1300,9 @@ func backupNotes(scope string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
 		return nil, failed(-32005, fmt.Errorf("nothing to backup"))
 	}
 
-	buf := buildBackupZip(root, m, notes, folders, scope)
+	// 整库备份带全部图片；只备份某个文件夹/单篇时，只带被这些正文引用到的图。
+	assets := assetsForNotes(root, notes, scope == "")
+	buf := buildBackupZip(root, m, notes, folders, scope, assets)
 	if len(buf) == 0 {
 		return nil, failed(-32005, fmt.Errorf("nothing to backup"))
 	}
@@ -1216,7 +1313,7 @@ func backupNotes(scope string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
 		if err := writeAtomic(dst, buf); err != nil {
 			return nil, failed(-32005, fmt.Errorf("write backup: %w", err))
 		}
-		return map[string]any{"ok": true, "path": dst, "dir": root, "count": len(notes)}, nil
+		return map[string]any{"ok": true, "path": dst, "dir": root, "count": len(notes), "assets": len(assets)}, nil
 	}
 	return map[string]any{
 		"ok":         true,
@@ -1225,6 +1322,7 @@ func backupNotes(scope string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
 		"bytes":      len(buf),
 		"count":      len(notes),
 		"folders":    folders,
+		"assets":     len(assets),
 		"storageDir": root,
 		"version":    resolveMetadata().Version,
 	}, nil
@@ -1302,11 +1400,14 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 	type item struct {
 		zipName string
 		rel     string
+		asset   bool
 	}
 	var items []item
 	var metaBytes []byte
 	var info backupInfo
 	var total uint64
+	// 图片单独计数：dryRun 与结果里都要能看到「这次带了几张图」。
+	assetEntries := 0
 
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() {
@@ -1344,8 +1445,25 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 			_ = rc.Close()
 			continue
 		}
+		// assets/ 是插件的保留目录（只放图片），**必须先判**：
+		// 否则一个叫 `assets/sneaky.md` 的条目会因为后缀是 .md 被当成正文写进去。
+		if strings.HasPrefix(rel, assetsDirName+"/") {
+			// 备份包是不可信输入，不能因为条目名以 assets/ 开头就照单全收。
+			if !isImageAssetRel(rel) {
+				continue
+			}
+			// 图片另受 8 MiB 上限（与 notes/putAsset / notes/getAsset 一致）：
+			// 能进来的合法图片都在这个尺寸内，超了只能是被人塞了别的东西。
+			if f.UncompressedSize64 > maxAssetBytes {
+				return nil, badParams("备份包内图片过大（%d 字节，上限 %d）：%s",
+					f.UncompressedSize64, maxAssetBytes, f.Name)
+			}
+			items = append(items, item{zipName: f.Name, rel: rel, asset: true})
+			assetEntries++
+			continue
+		}
 		if !strings.HasSuffix(strings.ToLower(rel), ".md") {
-			continue // 只接受 .md 正文；其余条目忽略，避免把杂七杂八的东西写进库
+			continue // 其余条目忽略，避免把杂七杂八的东西写进库
 		}
 		items = append(items, item{zipName: f.Name, rel: rel})
 	}
@@ -1388,7 +1506,9 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 		return map[string]any{
 			"ok": true, "dryRun": true, "info": info,
 			"files": len(items), "notes": notes, "folders": folders,
-			"storageDir": root,
+			"assets": assetEntries, "assetEntries": assetEntries,
+			"filesScanned": len(items),
+			"storageDir":  root,
 		}, nil
 	}
 
@@ -1406,7 +1526,8 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 			}
 		}
 		if len(cnotes) > 0 {
-			b := buildBackupZip(root, cur, cnotes, cf, "")
+			// 安全快照必须**连图片一起**存：恢复错了要能退回去，退回去却少了图等于没退。
+			b := buildBackupZip(root, cur, cnotes, cf, "", assetsForNotes(root, cnotes, true))
 			p := absUnique(filepath.Join(root, "pre-restore-"+time.Now().Format("20060102-150405")+".zip"))
 			if err := writeAtomic(p, b); err == nil {
 				safety = p
@@ -1420,6 +1541,7 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 	}
 
 	written := 0
+	assetsWritten := 0
 	for _, it := range items {
 		f := byName[it.zipName]
 		if f == nil {
@@ -1445,6 +1567,9 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 			return nil, failed(-32006, fmt.Errorf("restore %s: %w", it.rel, e))
 		}
 		written++
+		if it.asset {
+			assetsWritten++
+		}
 	}
 
 	// 索引最后写：正文全就位了再切换索引，中途失败至少不会出现「索引指向不存在的文件」。
@@ -1460,10 +1585,11 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 	contentHashes = map[string]string{}
 	hashMu.Unlock()
 
-	sidecarTrace(fmt.Sprintf("notes/restore ok dir=%s files=%d notes=%d safety=%s",
-		root, written, notes, safety))
+	sidecarTrace(fmt.Sprintf("notes/restore ok dir=%s files=%d notes=%d assets=%d safety=%s",
+		root, written, notes, assetsWritten, safety))
 	return map[string]any{
 		"ok": true, "files": written, "notes": notes, "folders": folders,
+		"assets": assetsWritten,
 		"storageDir": root, "safetyPath": safety, "backup": info,
 	}, nil
 }

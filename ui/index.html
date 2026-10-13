@@ -70,9 +70,7 @@
             <div id="more-menu" class="more-menu" role="menu" hidden>
               <button id="btn-table-note" role="menuitem">为表新建笔记</button>
               <button id="btn-export-md" role="menuitem">导出 .md</button>
-              <!-- 导入功能暂时下线（app.js 里 ENABLE_IMPORT=false）。
-                   恢复：把 app.js 的 ENABLE_IMPORT 改成 true，并把下面两处取消注释。 -->
-              <!-- <button id="btn-import-md" role="menuitem">导入 .md</button> -->
+              <button id="btn-import-md" role="menuitem">导入 .md</button>
               <button id="btn-backup-zip" role="menuitem">备份 zip</button>
               <button id="btn-restore-zip" role="menuitem">恢复备份…</button>
             </div>
@@ -235,7 +233,10 @@
   </div>
 
   <div id="toast" class="toast" hidden></div>
-  <!-- <input id="file-input" type="file" accept=".md,.markdown,.txt" multiple hidden /> -->
+  <!-- 导入：两个选择器。「选文件夹」用 webkitdirectory，File 上会带 webkitRelativePath，
+       侧车/前端据此重建目录结构。两个 input 都在（ENABLE_IMPORT=true），闸门会校验一致性。 -->
+  <input id="file-input" type="file" accept=".md,.markdown,.txt" multiple hidden />
+  <input id="dir-input" type="file" webkitdirectory hidden />
   <input id="backup-input" type="file" accept=".zip" hidden />
 
   <script src="sql-highlight.js"></script>

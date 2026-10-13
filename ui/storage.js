@@ -58,7 +58,7 @@
 
   /* ============ 诊断日志（页面置顶诊断条 + 状态弹窗共用，实时刷新） ============ */
 
-  var UI_VERSION = "0.8.6";   // 打包脚本会校验它与 manifest.version 一致
+  var UI_VERSION = "0.8.8";   // 打包脚本会校验它与 manifest.version 一致
   var T0 = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
   /** 自模块加载起的毫秒数（给每条日志打上相对时间，能看出卡在哪一步） */
   function since() {
@@ -859,6 +859,23 @@
 
     /** AI 调用的超时（毫秒），供 UI 显示进度预期 */
     AI_TIMEOUT: AI_TIMEOUT,
+
+    /* ---------------- 图片资源（粘贴 / 拖入的图片） ----------------
+     * 为什么必须走侧车：沙箱前端没有磁盘权限（CSP default-src 'none'，
+     * window.origin 还是 opaque origin），唯一落盘通道就是 invoke → 侧车。
+     * 图片落成 <storage_dir>/assets/<名字>，markdown 里只写相对路径。 */
+
+    /** 存一张图。dataBase64 是前端压缩后的字节；返回 { relPath, bytes, sha256, mime } */
+    putAsset: function (mime, dataBase64, name) {
+      return rpc("notes/putAsset", {
+        mime: mime, dataBase64: dataBase64, name: name || ""
+      }, RPC_TIMEOUT);
+    },
+
+    /** 按相对路径读回一张图（预览用）。返回 { relPath, mime, bytes, dataBase64 } */
+    getAsset: function (relPath) {
+      return rpc("notes/getAsset", { relPath: relPath }, RPC_TIMEOUT);
+    },
 
     /* ---------------- UI 偏好（面板宽度等，存在插件数据目录，不进笔记目录） ---------------- */
 

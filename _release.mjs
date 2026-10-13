@@ -16,9 +16,35 @@
 //   dist/<id>-<version>-<target>.dbxp
 //   dist/<id>-<version>-<target>.artifact.json
 //   dist/release-candidates.json
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { runProcess } from "./_testutil.mjs";
+/**
+ * 执行子进程并等它结束 —— **只走异步 spawn**。
+ * 本机沙箱里 spawnSync(<exe>) 对任何 exe 都立刻 EBUSY，探测用例会误报成「进程没回应」。
+ * 返回 { code, signal, out, err, error }；报错时一定要把 error.message 打出来。
+ */
+function runProcess(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try { child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env || process.env }); }
+    catch (e) { resolve({ code: null, signal: null, out: "", err: String(e), error: e }); return; }
+    let out = "", err = "", done = false, timer = null;
+    const finish = (p) => { if (!done) { done = true; if (timer) clearTimeout(timer); resolve(p); } };
+    if (opts.timeoutMs) {
+      timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ }
+        finish({ code: null, signal: "TIMEOUT", out, err, error: new Error("timeout after " + opts.timeoutMs + "ms") }); }, opts.timeoutMs);
+    }
+    if (child.stdout) child.stdout.on("data", (c) => { out += c; });
+    if (child.stderr) child.stderr.on("data", (c) => { err += c; });
+    child.on("error", (e) => finish({ code: null, signal: null, out, err, error: e }));
+    child.on("close", (code, signal) => finish({ code, signal, out, err }));
+    if (child.stdin) {
+      child.stdin.on("error", () => { /* 子进程提前退出时写 stdin 会 EPIPE */ });
+      child.stdin.end(opts.input != null ? opts.input : undefined);
+    }
+  });
+}
 
 const ROOT = "D:/core/web/dbx-pj/dbx-md-notes";
 const BINARY = "dbx-plugin-mdnotes";
@@ -49,7 +75,7 @@ for (const t of list) {
 const mani = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
 const ver = mani.version;
 
-// 用**异步** spawn（见 _testutil.mjs）：本机沙箱里 spawnSync 对任何 exe 都直接 EBUSY。
+// 用**异步** spawn：本机沙箱里 spawnSync 对任何 exe 都直接 EBUSY，必须异步。
 async function run(cmd, args, opts = {}) {
   const r = await runProcess(cmd, args, { cwd: ROOT, env: opts.env || process.env, timeoutMs: 600000 });
   if (r.out) process.stdout.write(r.out);

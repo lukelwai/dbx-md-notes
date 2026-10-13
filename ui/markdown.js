@@ -2,8 +2,13 @@
  * 轻量 Markdown 渲染器（无外部依赖，纯前端）
  * 暴露：window.MDNotes.renderMarkdown(src) -> HTML 字符串
  * 支持：标题、加粗/斜体/删除线、行内代码、代码块（```sql 走 SQL 高亮）、
- *       无序/有序列表（含一层嵌套）、引用、表格、分隔线、链接、段落。
- * 安全：文本先转义 HTML，仅输出受控标签；链接仅允许 http/https/#/mailto。
+ *       无序/有序列表（含一层嵌套）、引用、表格、分隔线、链接、图片、段落。
+ * 图片规则：
+ *   - `assets/…` 相对路径 → 输出 <img class="md-img" data-src="…">（占位），
+ *     字节由 app.js 异步去侧车取（沙箱没有磁盘权限）；
+ *   - 外链 / 绝对路径 → 降级成 <span class="md-img-ext">（沙箱 CSP 加载不了）。
+ * 安全：文本先转义 HTML，属性值另走 attr() 转义引号；仅输出受控标签；
+ *       链接仅允许 http/https/#/mailto。
  */
 (function () {
   "use strict";
@@ -12,12 +17,29 @@
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
 
+  /** 属性值转义：esc() 不管引号，塞进 HTML 属性会被注入 */
+  function attr(s) {
+    return esc(s).replace(/"/g, "&quot;");
+  }
+
   function inline(text) {
     var codes = [];
     text = esc(text);
     text = text.replace(/`([^`]+)`/g, function (_, c) {
       codes.push(c);
       return "@@C" + (codes.length - 1) + "@@";
+    });
+    // 图片必须放在链接规则**之前**：否则 ![alt](x) 会被链接规则吃掉一半，
+    // 渲染出一个带着感叹号的链接（老渲染器就是这个行为）。
+    //   - assets/ 开头的相对路径 → 真 <img>，但先只放 data-src 占位；
+    //     字节要异步去侧车取（沙箱没有磁盘权限），由 app.js 的 resolveMarkdownImages 补齐。
+    //   - 外链 / 绝对路径 → 沙箱 CSP 本来也加载不了，直接降级成可读的提示，别留一个破图。
+    text = text.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, function (_, alt, u) {
+      var a = attr(alt), src = attr(u);
+      if (/^assets\/[A-Za-z0-9._\-\/]+$/.test(u)) {
+        return '<img class="md-img" data-src="' + src + '" alt="' + a + '">';
+      }
+      return '<span class="md-img-ext" title="' + src + '">🖼 ' + (a || "外链图片") + "</span>";
     });
     text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (_, t, u) {
       if (/^(https?:\/\/|\/|#|mailto:)/i.test(u)) {

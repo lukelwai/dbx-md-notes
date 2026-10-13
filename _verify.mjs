@@ -1,12 +1,48 @@
 // 校验 .dbxp：条目、manifest.executable、checksums 精确覆盖 + sha256、关键代码标记
 // 用法: node _verify.mjs [某个.dbxp]   不给参数时自动取 dist/ 下最新的那个，
 // 并拿它和源码 manifest.json 的版本比对（防止「验的是旧包」这种假绿）。
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
-import { removeTree, runProcess } from "./_testutil.mjs";
+/**
+ * 删除测试临时目录 —— 直接 fs.rmSync，就这一行。
+ * 本机沙箱对「逐个文件删除」有接管：unlinkSync/rmdirSync 循环几百个文件就卡死十几分钟，
+ * cmd rd 反而比 fs.rmSync 慢一个数量级（实测 300 个小文件：rmSync 3.7s / cmd 41s）。
+ * 别再加 spawnSync（对任何 exe 直接 EBUSY）或逐文件循环。
+ */
+function removeTree(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 清理失败不该让用例失败 */ }
+}
+
+/**
+ * 执行子进程并等它结束 —— **只走异步 spawn**。
+ * 本机沙箱里 spawnSync(<exe>) 对任何 exe 都立刻 EBUSY，探测用例会误报成「进程没回应」。
+ * 返回 { code, signal, out, err, error }；报错时一定要把 error.message 打出来。
+ */
+function runProcess(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try { child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env || process.env }); }
+    catch (e) { resolve({ code: null, signal: null, out: "", err: String(e), error: e }); return; }
+    let out = "", err = "", done = false, timer = null;
+    const finish = (p) => { if (!done) { done = true; if (timer) clearTimeout(timer); resolve(p); } };
+    if (opts.timeoutMs) {
+      timer = setTimeout(() => { try { child.kill(); } catch { /* ignore */ }
+        finish({ code: null, signal: "TIMEOUT", out, err, error: new Error("timeout after " + opts.timeoutMs + "ms") }); }, opts.timeoutMs);
+    }
+    if (child.stdout) child.stdout.on("data", (c) => { out += c; });
+    if (child.stderr) child.stderr.on("data", (c) => { err += c; });
+    child.on("error", (e) => finish({ code: null, signal: null, out, err, error: e }));
+    child.on("close", (code, signal) => finish({ code, signal, out, err }));
+    if (child.stdin) {
+      child.stdin.on("error", () => { /* 子进程提前退出时写 stdin 会 EPIPE */ });
+      child.stdin.end(opts.input != null ? opts.input : undefined);
+    }
+  });
+}
 
 const ROOT = "D:/core/web/dbx-pj/dbx-md-notes";
 const srcMani = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8"));
@@ -93,7 +129,7 @@ const HOST_TARGET = (() => {
 })();
 
 async function probePackagedSidecar() {
-  const out = { ok: false, detail: "", versionOk: false, version: "", probeOk: false, probeDetail: "", aiOk: false, aiDetail: "", aiSetOk: false, aiSetDetail: "", skip: false };
+  const out = { ok: false, detail: "", versionOk: false, version: "", probeOk: false, probeDetail: "", aiOk: false, aiDetail: "", aiSetOk: false, aiSetDetail: "", assetOk: false, assetDetail: "", assetBkOk: false, assetBkDetail: "", saveOk: false, saveDetail: "", skip: false };
   if (pkgTarget && pkgTarget !== HOST_TARGET) {
     out.skip = true;
     out.detail = `非本机平台（包=${pkgTarget} 本机=${HOST_TARGET}），无法执行 —— 需在该平台真机冒烟`;
@@ -113,29 +149,46 @@ async function probePackagedSidecar() {
     fs.mkdirSync(storeDir, { recursive: true });
     fs.writeFileSync(exePath, exeBytes);
     if (!exeRel.endsWith(".exe")) { fs.chmodSync(exePath, 0o755); }
-    const input = [
-      JSON.stringify({ jsonrpc: "2.0", id: "1", method: "plugin/initialize", params: { host: { protocolVersions: [1] } } }),
-      JSON.stringify({ jsonrpc: "2.0", id: "2", method: "notes/probe", params: { storage_dir: storeDir } }),
-      JSON.stringify({ jsonrpc: "2.0", id: "3", method: "ai/config", params: {} }),
-      JSON.stringify({ jsonrpc: "2.0", id: "4", method: "ai/setConfig", params: { persist: false, model: "probe" } }),
-    ].join("\n") + "\n";
-    // 侧车**必须用异步 spawn**（见 _testutil.mjs：本机沙箱里 spawnSync 对任何 exe 都 EBUSY，
-    // 会被误判成"侧车起不来"）。刚写出来的二进制还可能被杀软短暂锁住，所以带重试。
+    // ⚠️ **侧车是并发处理请求的**（实测回包顺序可以是 1,7,8,2,5），所以「先后依赖」的步骤
+    // 不能塞进同一个进程的一次 stdin —— notes/save 还没落盘，notes/backup 就已经回
+    // "nothing to backup" 了。凡是有依赖的步骤，各自起一次进程（目录在磁盘上，跨进程可见）。
     const env = { ...process.env, DBX_PLUGIN_DATA_DIR: dataDir };
-    const runProbe = () => runProcess(exePath, [], { env, input, timeoutMs: 60000 });
-    let r = await runProbe();
-    for (let i = 0; i < 4 && r.error && /EBUSY|EPERM|ETXTBSY|EACCES/.test(String(r.error.code || r.error.message)); i++) {
-      await new Promise((res) => setTimeout(res, 500));
-      r = await runProbe();
-    }
-    const replies = new Map();
-    String(r.out || "").split(/\r?\n/).forEach((line) => {
-      if (!line.trim()) return;
-      try {
-        const m = JSON.parse(line);
-        if (m && m.id != null) { replies.set(String(m.id), m); }
-      } catch { /* 非 JSON 行忽略 */ }
+    const send = (reqs) => runProcess(exePath, [], {
+      env,
+      input: reqs.map((r) => JSON.stringify({ jsonrpc: "2.0", ...r })).join("\n") + "\n",
+      timeoutMs: 60000,
     });
+    const parse = (r) => {
+      const replies = new Map();
+      String(r.out || "").split(/\r?\n/).forEach((line) => {
+        if (!line.trim()) return;
+        try {
+          const m = JSON.parse(line);
+          if (m && m.id != null) { replies.set(String(m.id), m); }
+        } catch { /* 非 JSON 行忽略 */ }
+      });
+      return replies;
+    };
+    // 刚写出来的二进制可能被杀软短暂锁住 → 带重试，且**必须异步 spawn**
+    //（本机沙箱里 spawnSync 对任何 exe 都 EBUSY，会被误判成"侧车起不来"）
+    const runOnce = async (reqs) => {
+      let r = await send(reqs);
+      for (let i = 0; i < 4 && r.error &&
+           /EBUSY|EPERM|ETXTBSY|EACCES/.test(String(r.error.code || r.error.message)); i++) {
+        await new Promise((res) => setTimeout(res, 500));
+        r = await send(reqs);
+      }
+      return { r, replies: parse(r) };
+    };
+
+    const first = await runOnce([
+      { id: "1", method: "plugin/initialize", params: { host: { protocolVersions: [1] } } },
+      { id: "2", method: "notes/probe", params: { storage_dir: storeDir } },
+      { id: "3", method: "ai/config", params: {} },
+      { id: "4", method: "ai/setConfig", params: { persist: false, model: "probe" } },
+    ]);
+    const r = first.r;
+    const replies = first.replies;
     const init = replies.get("1");
     if (init && init.result && init.result.plugin) {
       out.ok = true;
@@ -164,6 +217,52 @@ async function probePackagedSidecar() {
     out.aiSetDetail = setCfg
       ? (setCfg.error ? JSON.stringify(setCfg.error).slice(0, 100) : "model=" + (setCfg.result || {}).model)
       : "无响应";
+
+    // 接下来三步**各有依赖，必须分次起进程**（见上面的并发说明）：
+    // 写一篇笔记 → 存一张图 → 整库备份，包里必须带 assets/。
+    // 这三件事的「在不在包里」无法靠 grep 判定，只有让包里的二进制真做一次才算证明。
+    const save = await runOnce([{
+      id: "s", method: "notes/save", params: { storage_dir: storeDir, data: {
+        version: 2, activeId: "probe-n1",
+        nodes: [{ id: "probe-n1", type: "note", name: "probe 笔记", parentId: null,
+          content: "# probe\n\n用于验证备份链路。\n", createdAt: "c", updatedAt: "u" }],
+      } },
+    }]);
+    const saveRep = save.replies.get("s");
+    out.saveOk = !!saveRep && !saveRep.error && !!(saveRep.result && saveRep.result.ok);
+    out.saveDetail = saveRep
+      ? (saveRep.error ? JSON.stringify(saveRep.error).slice(0, 120) : "ok path=" + String((saveRep.result || {}).path || ""))
+      : "无响应";
+
+    const putRun = await runOnce([{
+      id: "p", method: "notes/putAsset", params: {
+        storage_dir: storeDir,
+        mime: "image/png",
+        // 1×1 PNG，够小够真
+        dataBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+        name: "probe.png",
+      },
+    }]);
+    const put = putRun.replies.get("p");
+    out.assetOk = !!put && !put.error && !!(put.result && String(put.result.relPath || "").startsWith("assets/"));
+    out.assetDetail = put
+      ? (put.error ? JSON.stringify(put.error).slice(0, 120) : String((put.result || {}).relPath || ""))
+      : "无响应";
+
+    const bkRun = await runOnce([{ id: "b", method: "notes/backup", params: { storage_dir: storeDir } }]);
+    const bk = bkRun.replies.get("b");
+    if (!bk || bk.error) {
+      out.assetBkOk = false;
+      out.assetBkDetail = bk ? JSON.stringify(bk.error).slice(0, 120) : "无响应";
+    } else {
+      // zip 的条目名以明文存在于本地文件头里，直接在解码后的字节里找 `assets/` 即可。
+      const raw = Buffer.from(String((bk.result || {}).dataBase64 || ""), "base64");
+      const hasAsset = raw.includes(Buffer.from("assets/", "utf8"));
+      out.assetBkOk = hasAsset && raw.length > 0;
+      out.assetBkDetail = hasAsset
+        ? `备份 ${raw.length}B，含 assets/ 条目（assets=${(bk.result || {}).assets}）`
+        : `备份 ${raw.length}B 里没有 assets/ —— 图片没进包`;
+    }
     return out;
   } catch (e) {
     out.detail = String((e && e.message) || e);
@@ -206,6 +305,7 @@ const st = get("ui/storage.js").toString("utf8");
 const ap = get("ui/app.js").toString("utf8");
 const ix = get("ui/index.html").toString("utf8");
 const cs = get("ui/styles.css").toString("utf8");
+const mkCode = get("ui/markdown.js").toString("utf8");
 const apCode = ap.replace(/\/\*[\s\S]*?\*\//g, "");   // 去注释再扫描
 // 判据与 _buildpkg.js 一致：`$("id").` 只在该 id 真实存在时才算安全
 const liveIds = new Set([...ix.replace(/<!--[\s\S]*?-->/g, "").matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
@@ -225,10 +325,34 @@ checks.push(
   ["诊断代码保留，便于日后一行放出来",
     ap.includes("verdictText") && ix.includes('id="diag-bar"') && ap.includes("SHOW_DIAG_LOG_IN_MODAL)")],
   ["styles.css 保留诊断条样式（复用）", cs.includes(".diag-bar") && cs.includes(".diag-log")],
-  ["导入功能已下线（HTML 里无可用 #btn-import-md / #file-input）",
-    !liveIds.has("btn-import-md") && !liveIds.has("file-input")],
-  ["app.js 开关 ENABLE_IMPORT=false", /var\s+ENABLE_IMPORT\s*=\s*false/.test(apCode)],
-  ["导入代码保留，便于一行放出来", ap.includes("function handleImport(") && ap.includes("function pickImportFiles(")],
+  /* ---- 导入 .md（v0.8.7 恢复并增强） ---- */
+  ["导入入口已恢复（#btn-import-md / #file-input / #dir-input 都在）",
+    liveIds.has("btn-import-md") && liveIds.has("file-input") && liveIds.has("dir-input")],
+  ["app.js 开关 ENABLE_IMPORT=true", /var\s+ENABLE_IMPORT\s*=\s*true/.test(apCode)],
+  ["导入支持「选文件夹」并会按相对路径重建目录",
+    apCode.includes("webkitdirectory") || apCode.includes("webkitRelativePath")],
+  ["导入弹框有冲突策略（跳过 / 自动改名 / 覆盖）",
+    apCode.includes('"skip"') && apCode.includes('"rename"') && apCode.includes('"overwrite"')],
+  ["导入会过滤非 Markdown（选文件夹时目录里所有文件都会送上来）",
+    apCode.includes("function mdFilesOnly(")],
+  /* ---- 图片（v0.8.7 新增） ---- */
+  ["侧车提供图片读写 RPC（notes/putAsset / notes/getAsset）",
+    st.includes('"notes/putAsset"') && st.includes('"notes/getAsset"')],
+  ["编辑器支持粘贴 / 拖入图片",
+    apCode.includes("bindEditorImageCapture") && apCode.includes("clipboardData")],
+  ["拖放导入已下线（不再承诺做不到的事）",
+    !apCode.includes("hasDroppableFile") &&
+    apCode.includes("hasDroppableImage") &&
+    !/拖到左侧目录树|也可以直接把文件拖到/.test(apCode)],
+  ["备份/恢复提示都会报出图片数量",
+    apCode.includes("张图片") && apCode.includes("r.assets")],
+  ["图片落盘前会压缩（canvas，GIF 与小于阈值的除外）",
+    apCode.includes("prepareImageForStore") && apCode.includes("toBlob")],
+  ["渲染器把 assets/ 相对路径渲染成 <img data-src>（外链降级）",
+    mkCode.includes('class="md-img"') && mkCode.includes("md-img-ext")],
+  ["前端把占位 img 换成 blob: URL（取不到则降级成可点击占位）",
+    apCode.includes("resolveMarkdownImages") && apCode.includes("URL.createObjectURL") &&
+    apCode.includes("md-img-missing")],
   ["app.js 没有重复的函数声明（后者会静默覆盖前者）",
     (() => {
       const seen = {};
@@ -345,6 +469,9 @@ checks.push(
   ["包内侧车支持 notes/probe（写盘通道可用）", probeExe.probeOk, probeExe.probeDetail, probeExe.skip ? "skip" : ""],
   ["包内侧车支持 ai/config（AI 功能真的在包里）", probeExe.aiOk, probeExe.aiDetail, probeExe.skip ? "skip" : ""],
   ["包内侧车支持 ai/setConfig（面板改配置真的可用）", probeExe.aiSetOk, probeExe.aiSetDetail, probeExe.skip ? "skip" : ""],
+  ["包内侧车能写笔记（notes/save 真的落盘）", probeExe.saveOk, probeExe.saveDetail, probeExe.skip ? "skip" : ""],
+  ["包内侧车能存图片（notes/putAsset 真的可用）", probeExe.assetOk, probeExe.assetDetail, probeExe.skip ? "skip" : ""],
+  ["包内备份带上 assets/ 图片目录（不漏图）", probeExe.assetBkOk, probeExe.assetBkDetail, probeExe.skip ? "skip" : ""],
 );
 
 console.log("=== 校验 ===");
