@@ -3192,6 +3192,11 @@
       setView(state.view);
       handleHostContext();
       render();
+      if (res.added > 0) {
+        var sample = (res.addedNotes || []).slice(0, 3).map(function (n) { return n.file; }).join("、");
+        toast("已在存储目录发现 " + res.added + " 篇未登记的 .md 笔记，已按所在目录自动加入"
+          + (sample ? "（如 " + sample + "）" : ""), "info");
+      }
       renderDiag(S.status());
       // 宽度与「上次是否开着 AI 栏」存在侧车（插件数据目录），这里读回来
       restoreChromePrefs();

@@ -58,7 +58,7 @@
 
   /* ============ 诊断日志（页面置顶诊断条 + 状态弹窗共用，实时刷新） ============ */
 
-  var UI_VERSION = "0.8.10";   // 打包脚本会校验它与 manifest.version 一致
+  var UI_VERSION = "0.8.11";   // 打包脚本会校验它与 manifest.version 一致
   var T0 = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
   /** 自模块加载起的毫秒数（给每条日志打上相对时间，能看出卡在哪一步） */
   function since() {
@@ -442,6 +442,36 @@
     });
   }
 
+  /* ====================== 打开时自动归位 ======================
+   * 打开应用（init）时调用：先让侧车扫描存储目录，把「磁盘上有、但索引里没有」的
+   * .md 按所在目录自动归入对应文件夹并登记，再返回与 readCurrent 一致的完整数据
+   *（多带 added / addedNotes / addedFolders 供 UI 提示）。非侧车后端退化为普通读取。 */
+  function reconcileLoad() {
+    if (!current) { current = memoryBackend(); }
+    if (current.name !== "sidecar") { return readCurrent(); }
+    return rpc("notes/reconcile", {}, RPC_TIMEOUT).then(function (pl) {
+      if (!pl || typeof pl !== "object") { return readCurrent(); }
+      setStatus({
+        storagePath: nonEmptyStr(pl.path) || status.storagePath,
+        storageDir: nonEmptyStr(pl.dir) || status.storageDir,
+        dirConfigured: pl.configured === true
+      });
+      return {
+        data: (pl.data && typeof pl.data === "object") ? pl.data : null,
+        pending: pl.pending || null,
+        backend: "sidecar",
+        persistent: true,
+        firstRun: !(pl.data && pl.data.nodes),
+        added: (pl.addedNotes && pl.addedNotes.length) || 0,
+        addedNotes: pl.addedNotes || [],
+        addedFolders: pl.addedFolders || []
+      };
+    }).catch(function (err) {
+      note("notes/reconcile 失败，退化到 notes/load", false, errText(err));
+      return readCurrent();
+    });
+  }
+
   /* ============================ 初始化 ============================ */
 
   function failHard(reason) {
@@ -543,12 +573,13 @@
               });
             }
 
-            return readCurrent().then(function (r) {
+            return reconcileLoad().then(function (r) {
               r.connectionId = status.connectionId;
               r.storageDir = status.storageDir;
               r.path = status.storagePath;
-              note("读取笔记 notes/load", true,
-                "节点数=" + ((r.data && r.data.nodes && r.data.nodes.length) || 0) + " firstRun=" + r.firstRun);
+              note("打开时自动归位 notes/reconcile", true,
+                "节点数=" + ((r.data && r.data.nodes && r.data.nodes.length) || 0)
+                + " 新增=" + (r.added || 0) + " firstRun=" + r.firstRun);
               return r;
             });
           });

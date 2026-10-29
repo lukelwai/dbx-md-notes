@@ -38,7 +38,7 @@ import (
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
 	pluginID      = "com.lwai.mdnotes"
-	pluginVersion = "0.8.10" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginVersion = "0.8.11" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -181,6 +181,10 @@ func (plugin *plugin) Handle(
 
 	case "notes/load":
 		return notesLoad()
+
+	case "notes/reconcile":
+		// 打开应用时：扫描存储目录、把「磁盘上有但索引里没有」的 .md 自动归位并登记。
+		return reconcileNotes()
 
 	case "notes/save":
 		var p struct {
@@ -745,6 +749,21 @@ func toRel(root, abs string) string {
 	return r
 }
 
+// genNodeID 生成全局唯一的节点 id（文件夹 fld-… / 笔记 nt-…）。
+// 用随机而非路径哈希：reconcile 的幂等性来自「按 File 去重」，同一次运行内的唯一性由 taken 集合保证。
+func genNodeID(prefix string) string {
+	return prefix + "-" + strconv.FormatInt(rand.Int63(), 36) + strconv.FormatInt(time.Now().UnixNano()%1000000, 36)
+}
+
+// isMarkdownExt 报告扩展名是否属于「笔记」文件（大小写不敏感）。
+func isMarkdownExt(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".md", ".markdown":
+		return true
+	}
+	return false
+}
+
 // ---------------- 内容哈希缓存（避免重复写盘） ----------------
 
 var hashMu sync.Mutex
@@ -1040,6 +1059,142 @@ func notesLoad() (any, *dbxpluginsdk.PluginError) {
 		"configured": dirConfigured(),
 		"pending":    takePending(),
 	}, nil
+}
+
+// reconcileNotes 在「打开应用」时调用：扫描存储目录里【真实存在、但还没登记进索引】的
+// .md / .markdown 文件，按它们所在的目录层级（位置）自动归入对应的文件夹、登记为笔记节点，
+// 再返回与 notes/load 一致的完整数据（额外附 added / addedNotes / addedFolders）。
+//
+// 设计取舍：
+//   - 只【新增】，绝不删除：和 saveNotes 的「未知 ≠ 要删」哲学一致。磁盘上多出来的 .md 不会动，只是补登进索引。
+//   - 不碰正文：文件已在磁盘上，登记时只写 meta；笔记正文由后续 notes/load 的复用逻辑从磁盘读回。
+//   - 跳过内部目录：.mdnotes（索引/回收站/探针）与 assets（图片库）；隐藏文件/目录也跳过。
+//   - 幂等：已登记过的 File 不再重复加入；文件夹按 File 复用已有节点，未建过才新建。
+func reconcileNotes() (any, *dbxpluginsdk.PluginError) {
+	// 目录还没配好（比如还没连上连接）：无法扫描，原样返回 load 数据，不报错、不登记。
+	if !dirConfigured() {
+		d, _ := notesLoad()
+		if m, ok := d.(map[string]any); ok {
+			m["added"] = 0
+			m["addedNotes"] = []any{}
+			m["addedFolders"] = []any{}
+			m["skipped"] = true
+		}
+		return d, nil
+	}
+	root := notesDir()
+
+	m := loadMeta()
+	existingFiles := map[string]bool{}
+	folderByRel := map[string]string{}
+	taken := map[string]bool{}
+	for _, n := range m.Nodes {
+		taken[n.ID] = true
+		if n.Type == "note" {
+			existingFiles[n.File] = true
+		} else if n.Type == "folder" {
+			folderByRel[n.File] = n.ID
+		}
+	}
+
+	var addedNotes []map[string]any
+	var addedFolders []map[string]any
+
+	// ensureFolder 按相对目录路径确保文件夹节点存在，返回其 id（root 返回 ""）。
+	var ensureFolder func(rel string) string
+	ensureFolder = func(rel string) string {
+		if rel == "" || rel == "." {
+			return ""
+		}
+		if id, ok := folderByRel[rel]; ok {
+			return id
+		}
+		var parentID *string
+		if pr := filepath.Dir(rel); pr != "." && pr != "" {
+			if pid := ensureFolder(pr); pid != "" {
+				parentID = &pid
+			}
+		}
+		id := genNodeID("fld")
+		for taken[id] {
+			id = genNodeID("fld")
+		}
+		taken[id] = true
+		name := sanitizeName(filepath.Base(rel))
+		m.Nodes = append(m.Nodes, MetaNode{ID: id, Type: "folder", Name: name, ParentID: parentID})
+		folderByRel[rel] = id
+		addedFolders = append(addedFolders, map[string]any{"id": id, "name": name, "file": rel, "parentId": parentID})
+		return id
+	}
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // 不可读的项跳过，不影响其余
+		}
+		if d.IsDir() {
+			// 跳过索引/回收站/探针目录与图片库，以及一切隐藏目录
+			if d.Name() == ".mdnotes" || d.Name() == "assets" {
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil // 隐藏文件跳过
+		}
+		if !isMarkdownExt(path) {
+			return nil
+		}
+		rel := toRel(root, path)
+		if existingFiles[rel] {
+			return nil // 已登记，跳过
+		}
+		var parentID *string
+		if dir := filepath.Dir(rel); dir != "." && dir != "" {
+			if fid := ensureFolder(dir); fid != "" {
+				parentID = &fid
+			}
+		}
+		id := genNodeID("nt")
+		for taken[id] {
+			id = genNodeID("nt")
+		}
+		taken[id] = true
+		stem := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
+		name := sanitizeName(stem)
+		if name == "" {
+			name = "untitled"
+		}
+		ts := ""
+		if info, ie := d.Info(); ie == nil {
+			ts = info.ModTime().Format(time.RFC3339)
+		}
+		m.Nodes = append(m.Nodes, MetaNode{ID: id, Type: "note", Name: name, ParentID: parentID, CreatedAt: ts, UpdatedAt: ts, File: rel})
+		existingFiles[rel] = true
+		addedNotes = append(addedNotes, map[string]any{"id": id, "name": name, "file": rel, "parentId": parentID})
+		return nil
+	})
+
+	if len(addedNotes) > 0 {
+		if err := saveMeta(m); err != nil {
+			return nil, failed(-32002, fmt.Errorf("reconcile 写回索引失败: %w", err))
+		}
+		sidecarTrace(fmt.Sprintf("notes/reconcile 新增笔记=%d 文件夹=%d dir=%s", len(addedNotes), len(addedFolders), root))
+	}
+
+	// 复用 notes/load 的完整数据（含正文），并附上本次新增信息
+	data, perr := notesLoad()
+	if perr != nil {
+		return nil, perr
+	}
+	if m2, ok := data.(map[string]any); ok {
+		m2["added"] = len(addedNotes)
+		m2["addedNotes"] = addedNotes
+		m2["addedFolders"] = addedFolders
+	}
+	return data, nil
 }
 
 // ---------------- 导出 / 备份 ----------------
