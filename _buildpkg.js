@@ -228,6 +228,14 @@ const files = [
   ["manifest.json", manifestBytes],
   [exeRel, fs.readFileSync(exePath)],
 ];
+// 顶层 LICENSE：自 0.8.10 起漏打包，这里补回（宿主商店要求随包附带许可证）。
+// 必须在下方 checksums 计算之前加入 files，否则会触发「checksums 不精确覆盖」安装拒绝。
+const licensePath = root + "LICENSE";
+if (fs.existsSync(licensePath)) {
+  files.push(["LICENSE", fs.readFileSync(licensePath)]);
+} else {
+  console.warn("\n[WARN] 仓库根目录缺少 LICENSE，包内将不含许可证文件。\n");
+}
 for (const dir of ["assets", "ui"]) {
   (function walk(d, rel) {
     for (const e of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {

@@ -15,5 +15,5 @@
   "source": "https://github.com/lukelwai/dbx-md-notes",
   "homepage": "https://github.com/lukelwai/dbx-md-notes",
   "license": "Apache-2.0",
-  "releaseNotes": "1.增加自动索引功能，打开应用自动扫描归位未记录的md笔记。"
+  "releaseNotes": "增加自动索引功能：打开应用自动扫描存储目录，将未登记到索引的 .md 笔记按所在目录层级自动归位到笔记中。"
 }
