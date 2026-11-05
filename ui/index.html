@@ -65,6 +65,30 @@
           <!-- 只留两个高频动作固定显示；其余收进「更多」，避免工具栏在窄窗口里换行、挤占正文高度 -->
           <button id="btn-insert-sql" title="在光标处插入一个 ```sql 代码块">插入 SQL 块</button>
           <button id="btn-ai" title="打开 / 收起右侧 AI 助手栏（Ctrl/Cmd+I）">AI 助手</button>
+          <div class="type-wrap">
+            <button id="btn-type" title="编辑区和预览的字体、字号、行距" aria-haspopup="true" aria-expanded="false">外观</button>
+            <div id="type-panel" class="type-panel" hidden>
+              <div class="type-row">
+                <div class="type-label">字体</div>
+                <select id="type-font" class="type-select"></select>
+                <div class="type-custom">
+                  <input id="type-font-custom" class="type-custom-input" placeholder="或直接填字体名，如 Consolas" spellcheck="false" />
+                  <button id="type-font-apply" type="button">使用</button>
+                </div>
+              </div>
+              <div class="type-row">
+                <div class="type-label">字号 <b id="type-size-val">13</b></div>
+                <input id="type-size" type="range" min="12" max="22" step="1" value="13" />
+              </div>
+              <div class="type-row">
+                <div class="type-label">行距 <b id="type-lh-val">1.7</b></div>
+                <input id="type-lh" type="range" min="1.3" max="2.4" step="0.1" value="1.7" />
+              </div>
+              <div class="type-foot">
+                <button id="type-reset" type="button">恢复默认</button>
+              </div>
+            </div>
+          </div>
           <div class="more-wrap">
             <button id="btn-more" class="more-btn" title="更多操作" aria-haspopup="true" aria-expanded="false">更多 ▾</button>
             <div id="more-menu" class="more-menu" role="menu" hidden>

@@ -2810,11 +2810,174 @@
     S.setPrefs({ sidebarWidth: layout.side, aiWidth: layout.ai });
   }
 
+  /* ---------------- 编辑区外观（字体 / 字号 / 行距） ----------------
+   * 跟栏宽一样写进 prefs.json。只改编辑区和预览，不动工具栏、目录树。
+   * 预览标题用 em，所以字号一变，标题跟着变，不用再单独调。
+   */
+  // 四个预设是快捷项；其余值是用户选的系统字体名，或自己填的名字。
+  var TYPE_PRESETS = [
+    { id: "mono", label: "等宽（默认）" },
+    { id: "sans", label: "黑体" },
+    { id: "serif", label: "宋体" },
+    { id: "kai", label: "楷体" }
+  ];
+  var TYPE_STACK = { mono: "var(--mono)", sans: "var(--sans)", serif: "var(--serif)", kai: "var(--kai)" };
+  var TYPE_SIZE_MIN = 12, TYPE_SIZE_MAX = 22, TYPE_SIZE_DEF = 13;
+  var TYPE_LH_MIN = 1.3, TYPE_LH_MAX = 2.4, TYPE_LH_DEF = 1.7;
+  var typeface = { font: "mono", size: TYPE_SIZE_DEF, lh: TYPE_LH_DEF };
+  var typeSaveTimer = null;
+  var systemFonts = null;   // null = 还没问过侧车；本会话只拉一次
+  var fontSelectBuilt = false;
+
+  function fontStack(name) {
+    if (TYPE_STACK[name]) { return TYPE_STACK[name]; }
+    // 自定义名放最前，后面留一套兜底：机器上没有这个字体时不至于变成方框。
+    return '"' + String(name).replace(/"/g, "") + '", var(--sans)';
+  }
+  function presetLabel(id) {
+    for (var i = 0; i < TYPE_PRESETS.length; i++) {
+      if (TYPE_PRESETS[i].id === id) { return TYPE_PRESETS[i].label; }
+    }
+    return "";
+  }
+
+  function clampTypeSize(v) {
+    var n = parseInt(v, 10);
+    if (!isFinite(n)) { return TYPE_SIZE_DEF; }
+    if (n < TYPE_SIZE_MIN) { return TYPE_SIZE_MIN; }
+    if (n > TYPE_SIZE_MAX) { return TYPE_SIZE_MAX; }
+    return n;
+  }
+  function clampTypeLh(v) {
+    var n = Math.round(Number(v) * 10) / 10;
+    if (!isFinite(n)) { return TYPE_LH_DEF; }
+    if (n < TYPE_LH_MIN) { return TYPE_LH_MIN; }
+    if (n > TYPE_LH_MAX) { return TYPE_LH_MAX; }
+    return n;
+  }
+
+  function fillFontSelect() {
+    var sel = $("type-font");
+    if (!sel) { return; }
+    var cur = typeface.font;
+    // 列表本会话只建一次。每次打开都清空重建，几百个带 font-family 的 option 会卡一下。
+    if (fontSelectBuilt) { sel.value = cur; return; }
+    sel.textContent = "";
+    var g1 = document.createElement("optgroup");
+    g1.label = "预设";
+    TYPE_PRESETS.forEach(function (p) {
+      var o = document.createElement("option");
+      o.value = p.id; o.textContent = p.label;
+      g1.appendChild(o);
+    });
+    sel.appendChild(g1);
+    var known = !!presetLabel(cur);
+    var listed = false;
+    if (systemFonts && systemFonts.length) {
+      var g2 = document.createElement("optgroup");
+      g2.label = "本机字体（" + systemFonts.length + "）";
+      systemFonts.forEach(function (name) {
+        var o = document.createElement("option");
+        o.value = name; o.textContent = name;
+        o.style.fontFamily = '"' + name.replace(/"/g, "") + '"';
+        g2.appendChild(o);
+        if (name === cur) { listed = true; }
+      });
+      sel.appendChild(g2);
+    }
+    if (!known && !listed && cur) {
+      var extra = document.createElement("option");
+      extra.value = cur; extra.textContent = cur + "（自定义）";
+      sel.appendChild(extra);
+    }
+    sel.value = cur;
+    fontSelectBuilt = true;
+  }
+
+  /** 本会话只向侧车要一次字体列表。之后点「外观」直接用缓存，不再扫盘。 */
+  function loadSystemFonts() {
+    if (systemFonts) { fillFontSelect(); return; }
+    systemFonts = [];   // 占位：请求飞出去的这段时间里再进来，不再发第二次
+    S.listFonts().then(function (list) {
+      systemFonts = (list || []).filter(function (n) { return typeof n === "string" && n; });
+      fontSelectBuilt = false;
+      fillFontSelect();
+      var sel = $("type-font");
+      if (sel && !systemFonts.length) {
+        sel.title = "没有读到本机字体，可在下面直接填字体名";
+      }
+    });
+  }
+
+  function applyTypeface() {
+    var app = $("app");
+    if (!app) { return; }
+    app.style.setProperty("--ed-font", fontStack(typeface.font));
+    app.style.setProperty("--ed-size", typeface.size + "px");
+    app.style.setProperty("--ed-lh", String(typeface.lh));
+    if (fontSelectBuilt) {
+      var selNow = $("type-font");
+      if (selNow) { selNow.value = typeface.font; }
+    }
+    var custom = $("type-font-custom");
+    if (custom && document.activeElement !== custom) { custom.value = presetLabel(typeface.font) ? "" : typeface.font; }
+    var size = $("type-size"), sizeVal = $("type-size-val");
+    if (size) { size.value = String(typeface.size); }
+    if (sizeVal) { sizeVal.textContent = String(typeface.size); }
+    var lh = $("type-lh"), lhVal = $("type-lh-val");
+    if (lh) { lh.value = typeface.lh.toFixed(1); }
+    if (lhVal) { lhVal.textContent = typeface.lh.toFixed(1); }
+  }
+
+  function saveTypefaceSoon() {
+    if (typeSaveTimer) { clearTimeout(typeSaveTimer); }
+    typeSaveTimer = setTimeout(function () {
+      typeSaveTimer = null;
+      S.setPrefs({
+        editorFont: typeface.font,
+        editorFontSize: typeface.size,
+        editorLineHeight: typeface.lh
+      });
+    }, 250);
+  }
+
+  function cleanFontInput(s) {
+    return String(s || "").replace(/["'<>;{}\\]/g, "").replace(/\s+/g, " ").trim().slice(0, 80);
+  }
+
+  function setTypeface(patch, persist) {
+    if (patch.font != null) {
+      var name = cleanFontInput(patch.font);
+      if (name) { typeface.font = name; }
+    }
+    if (patch.size != null) { typeface.size = clampTypeSize(patch.size); }
+    if (patch.lh != null) { typeface.lh = clampTypeLh(patch.lh); }
+    applyTypeface();
+    if (persist) { saveTypefaceSoon(); }
+  }
+
+  function setTypePanelOpen(open) {
+    var p = $("type-panel"), b = $("btn-type");
+    if (!p) { return; }
+    p.hidden = !open;
+    if (b) { b.setAttribute("aria-expanded", open ? "true" : "false"); }
+    if (b) { if (open) { b.classList.add("on"); } else { b.classList.remove("on"); } }
+  }
+  function closeTypePanel() { setTypePanelOpen(false); }
+  function toggleTypePanel() {
+    var p = $("type-panel");
+    setTypePanelOpen(!!(p && p.hidden));
+  }
+
   function loadLayout() {
     return S.getPrefs().then(function (p) {
       if (p && typeof p.sidebarWidth === "number") { layout.side = clampWidth(p.sidebarWidth, SIDE_MIN, SIDE_MAX); }
       if (p && typeof p.aiWidth === "number") { layout.ai = clampWidth(p.aiWidth, AI_MIN, AI_MAX); }
+      if (p && typeof p.editorFont === "string" && cleanFontInput(p.editorFont)) { typeface.font = cleanFontInput(p.editorFont); }
+      if (p && typeof p.editorFontSize === "number") { typeface.size = clampTypeSize(p.editorFontSize); }
+      if (p && typeof p.editorLineHeight === "number") { typeface.lh = clampTypeLh(p.editorLineHeight); }
       applyLayout();
+      applyTypeface();
       aiState.layoutReady = true;
       if (p && p.aiPanelOpen === true) { setAIPanelOpen(true); }
       return p;
@@ -2881,10 +3044,13 @@
   /** 启动早期：立刻把分隔条接上（纯 DOM，不依赖侧车） */
   function initChrome() {
     initGutters();
+    applyTypeface();
   }
 
   /** 存储就绪后：读回上次的宽度与面板开关（要发 RPC，所以不能更早） */
   function restoreChromePrefs() {
+    // 字体列表跟偏好一起在启动时拉。扫盘放在打开面板的那一下，会让第一次点击卡一下。
+    loadSystemFonts();
     return loadLayout().catch(function () { /* 偏好读不到不影响主流程 */ });
   }
 
@@ -2901,6 +3067,23 @@
     click("btn-table-note", function () { openTableModal(null); });
     click("btn-insert-sql", insertSqlBlock);
     click("btn-more", toggleMoreMenu);
+    click("btn-type", toggleTypePanel);
+    on("type-font", "onchange", function () { setTypeface({ font: $("type-font").value }, true); });
+    function applyCustomFont() {
+      var el = $("type-font-custom");
+      var name = el ? cleanFontInput(el.value) : "";
+      if (!name) { toast("先填一个字体名", "warn"); return; }
+      setTypeface({ font: name }, true);
+    }
+    click("type-font-apply", applyCustomFont);
+    on("type-font-custom", "onkeydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); applyCustomFont(); }
+    });
+    on("type-size", "oninput", function () { setTypeface({ size: $("type-size").value }, true); });
+    on("type-lh", "oninput", function () { setTypeface({ lh: $("type-lh").value }, true); });
+    click("type-reset", function () {
+      setTypeface({ font: "mono", size: TYPE_SIZE_DEF, lh: TYPE_LH_DEF }, true);
+    });
     // 点「更多」里的任一项都收起菜单（动作本身由各自的 onclick 执行，这里只负责关）
     var moreMenu = $("more-menu");
     if (moreMenu) {
@@ -3079,6 +3262,7 @@
       if (e.key === "Escape") {
         closeCtxMenu();
         closeMoreMenu();
+        closeTypePanel();
         if (!$("modal").hidden) { closeModal(); }
         if (!$("table-modal").hidden) { closeTableModal(); }
         if (!$("ai-cfg-modal").hidden) { closeAIConfigModal(); }
@@ -3091,6 +3275,8 @@
       closeCtxMenu();
       var wrap = document.querySelector(".more-wrap");
       if (!wrap || !wrap.contains(e.target)) { closeMoreMenu(); }
+      var typeWrap = document.querySelector(".type-wrap");
+      if (!typeWrap || !typeWrap.contains(e.target)) { closeTypePanel(); }
     });
 
     // 主题跟随 DBX

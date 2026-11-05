@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf16"
 	"sync/atomic"
 	"time"
 
@@ -271,6 +272,9 @@ func (plugin *plugin) Handle(
 	case "ui/setPrefs":
 		return setPrefsHandler(params)
 
+	case "ui/listFonts":
+		return map[string]any{"fonts": cachedSystemFonts()}, nil
+
 	case "connection/action":
 		// 连接表单里的自定义动作（如「测试 AI 连接」）。参数同样带完整的 connection
 		// （含补齐的 connection_secrets），所以先吸收配置再执行 —— 用户不必先保存就能测。
@@ -488,7 +492,13 @@ func dirConfigured() bool {
  * 放这里而不是笔记存储目录 / meta.json：面板宽度是"这台机器上的界面偏好"，
  * 不是笔记数据 —— 不该跟着笔记目录走，更不该让它在多实例间互相覆盖。
  */
-var prefKeys = map[string]bool{"sidebarWidth": true, "aiWidth": true, "aiPanelOpen": true}
+var prefKeys = map[string]bool{
+	"sidebarWidth": true, "aiWidth": true, "aiPanelOpen": true,
+	"editorFont": true, "editorFontSize": true, "editorLineHeight": true,
+}
+
+// 预设只是快捷项。editorFont 也接受任意系统字体名（见 cleanFontName）。
+var editorFonts = map[string]bool{"mono": true, "sans": true, "serif": true, "kai": true}
 
 func prefsPath() string { return filepath.Join(dataDir(), "prefs.json") }
 
@@ -500,6 +510,27 @@ func clampPrefWidth(v int) int {
 		return 720
 	}
 	return v
+}
+
+func clampEditorSize(v int) int {
+	if v < 12 {
+		return 12
+	}
+	if v > 22 {
+		return 22
+	}
+	return v
+}
+
+// 行距按 0.1 对齐，避免滑条每动一下就多出一长串小数。
+func clampEditorLine(v float64) float64 {
+	if v < 1.3 {
+		v = 1.3
+	}
+	if v > 2.4 {
+		v = 2.4
+	}
+	return float64(int(v*10+0.5)) / 10
 }
 
 // sanitizePrefs 只保留白名单键，并把数值钳到合理范围（坏值不该把界面卡死）。
@@ -526,9 +557,300 @@ func sanitizePrefs(in map[string]any) map[string]any {
 				continue
 			}
 			out[k] = b
+		case "editorFont":
+			s, ok := v.(string)
+			if !ok {
+				continue
+			}
+			name := cleanFontName(s)
+			if name == "" {
+				continue
+			}
+			out[k] = name
+		case "editorFontSize":
+			n, ok := prefInt(v)
+			if !ok {
+				continue
+			}
+			out[k] = clampEditorSize(n)
+		case "editorLineHeight":
+			f, ok := prefFloat(v)
+			if !ok {
+				continue
+			}
+			out[k] = clampEditorLine(f)
 		}
 	}
 	return out
+}
+
+// cleanFontName 只留能写进 CSS font-family 的名字：去掉引号、分号、反斜杠。
+// 预设键（mono/sans/serif/kai）原样保留。
+func cleanFontName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || editorFonts[s] {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"', '\'', ';', '\\', '<', '>', '{', '}', '\n', '\r':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > 80 {
+		out = out[:80]
+	}
+	return out
+}
+
+// cachedSystemFonts 一次侧车进程只扫一次盘。
+// DBX 里侧车跟着插件走：第一次打开插件才读字体文件，之后点「外观」直接拿内存里的结果。
+// 新装字体要等下次重新打开插件才会出现。
+var (
+	fontCacheMu sync.Mutex
+	fontCache   []string
+	fontCached  bool
+)
+
+func cachedSystemFonts() []string {
+	fontCacheMu.Lock()
+	defer fontCacheMu.Unlock()
+	if fontCached {
+		return fontCache
+	}
+	fontCache = listSystemFonts()
+	fontCached = true
+	return fontCache
+}
+
+// listSystemFonts 扫本机字体目录，读每个字体文件里的真实族名（不是文件名）。
+// 前端跑在沙箱里，读不到这些目录。读不到或扫失败时返回空列表，界面退回手填。
+func listSystemFonts() []string {
+	seen := map[string]bool{}
+	var names []string
+	add := func(name string) {
+		name = cleanFontName(name)
+		if name == "" || editorFonts[name] || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	for _, dir := range fontDirs() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(e.Name()))
+			if ext != ".ttf" && ext != ".otf" && ext != ".ttc" {
+				continue
+			}
+			fam := fontFamilyOf(filepath.Join(dir, e.Name()))
+			if fam == "" {
+				continue
+			}
+			add(fam)
+		}
+	}
+	sort.Strings(names)
+	if len(names) > 400 {
+		names = names[:400]
+	}
+	return names
+}
+
+// fontFamilyOf 从 ttf/otf/ttc 的 name 表读字体族名（nameID=1）。
+// 优先中文（简体 2052 / 繁体 1028 / 语言 0x04），没有再退回英文。
+// 解析失败返回空串 —— 调用方跳过这个文件，绝不拿文件名冒充族名。
+func fontFamilyOf(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() < 12 || st.Size() > 80<<20 {
+		return ""
+	}
+	head := make([]byte, 12)
+	if _, err := io.ReadFull(f, head); err != nil {
+		return ""
+	}
+	tag := string(head[0:4])
+	if tag == "ttcf" {
+		n := int(u32be(head[8:12]))
+		if n <= 0 || n > 64 {
+			return ""
+		}
+		off := make([]byte, 4)
+		if _, err := io.ReadFull(f, off); err != nil {
+			return ""
+		}
+		return familyAt(f, int64(u32be(off)))
+	}
+	if tag != "\x00\x01\x00\x00" && tag != "OTTO" && tag != "true" {
+		return ""
+	}
+	return familyInSFNT(f, 12, int(u16be(head[4:6])))
+}
+
+func familyAt(f *os.File, off int64) string {
+	head := make([]byte, 12)
+	if _, err := f.ReadAt(head, off); err != nil {
+		return ""
+	}
+	tag := string(head[0:4])
+	if tag != "\x00\x01\x00\x00" && tag != "OTTO" && tag != "true" {
+		return ""
+	}
+	return familyInSFNT(f, off+12, int(u16be(head[4:6])))
+}
+
+func familyInSFNT(f *os.File, dirOff int64, nTables int) string {
+	if nTables <= 0 || nTables > 64 {
+		return ""
+	}
+	dir := make([]byte, nTables*16)
+	if _, err := f.ReadAt(dir, dirOff); err != nil {
+		return ""
+	}
+	var nameOff int64
+	var nameLen int
+	for i := 0; i < nTables; i++ {
+		rec := dir[i*16 : i*16+16]
+		if string(rec[0:4]) == "name" {
+			nameOff = int64(u32be(rec[8:12]))
+			nameLen = int(u32be(rec[12:16]))
+			break
+		}
+	}
+	if nameOff == 0 || nameLen < 6 || nameLen > 1<<20 {
+		return ""
+	}
+	buf := make([]byte, nameLen)
+	if _, err := f.ReadAt(buf, nameOff); err != nil {
+		return ""
+	}
+	count := int(u16be(buf[2:4]))
+	storage := int(u16be(buf[4:6]))
+	if storage < 0 || storage > len(buf) {
+		return ""
+	}
+	type hit struct{ pri int; s string }
+	best := hit{pri: 99}
+	for i := 0; i < count; i++ {
+		at := 6 + i*12
+		if at+12 > storage || at+12 > len(buf) {
+			break
+		}
+		rec := buf[at : at+12]
+		if u16be(rec[6:8]) != 1 { // nameID 1 = Font Family
+			continue
+		}
+		plat, enc, lang := u16be(rec[0:2]), u16be(rec[2:4]), u16be(rec[4:6])
+		length, off := int(u16be(rec[8:10])), int(u16be(rec[10:12]))
+		start := storage + off
+		if length <= 0 || start < 0 || start+length > len(buf) {
+			continue
+		}
+		raw := buf[start : start+length]
+		var text string
+		var pri int
+		switch {
+		case plat == 3 && (enc == 1 || enc == 10): // Windows Unicode
+			text = decodeUTF16BE(raw)
+			switch lang {
+			case 0x0804: // 简体中文
+				pri = 0
+			case 0x0404: // 繁体中文
+				pri = 1
+			default:
+				if lang&0xFF == 0x04 {
+					pri = 2
+				} else if lang == 0x0409 {
+					pri = 4
+				} else {
+					pri = 5
+				}
+			}
+		case plat == 1 && enc == 0: // Mac Roman
+			text = string(raw)
+			pri = 6
+		default:
+			continue
+		}
+		text = cleanFontName(text)
+		if text == "" {
+			continue
+		}
+		if pri < best.pri {
+			best = hit{pri: pri, s: text}
+		}
+	}
+	return best.s
+}
+
+func decodeUTF16BE(b []byte) string {
+	if len(b)%2 == 1 {
+		b = b[:len(b)-1]
+	}
+	u := make([]uint16, len(b)/2)
+	for i := range u {
+		u[i] = u16be(b[i*2 : i*2+2])
+	}
+	return string(utf16.Decode(u))
+}
+
+func u16be(b []byte) uint16 { return uint16(b[0])<<8 | uint16(b[1]) }
+func u32be(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+func fontDirs() []string {
+	var dirs []string
+	if windir := os.Getenv("WINDIR"); windir != "" {
+		dirs = append(dirs, filepath.Join(windir, "Fonts"))
+	}
+	if local := os.Getenv("LOCALAPPDATA"); local != "" {
+		dirs = append(dirs, filepath.Join(local, "Microsoft", "Windows", "Fonts"))
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		dirs = append(dirs,
+			filepath.Join(home, "Library", "Fonts"),
+			filepath.Join(home, ".local", "share", "fonts"),
+			filepath.Join(home, ".fonts"),
+		)
+	}
+	dirs = append(dirs, "/Library/Fonts", "/System/Library/Fonts", "/usr/share/fonts", "/usr/local/share/fonts")
+	return dirs
+}
+
+func prefFloat(v any) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case json.Number:
+		f, err := t.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
 }
 
 func prefInt(v any) (int, bool) {

@@ -24,6 +24,13 @@
   --shadow: 0 1px 2px rgba(31, 35, 40, .06), 0 6px 18px rgba(31, 35, 40, .08);
   --radius: 8px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+  --serif: "Source Han Serif SC", "Noto Serif SC", "Songti SC", "SimSun", "STSong", serif;
+  --kai: "KaiTi", "STKaiti", "Kaiti SC", "楷体", serif;
+  /* 编辑区 / 预览区排版，由「外观」面板改写 */
+  --ed-font: var(--mono);
+  --ed-size: 13px;
+  --ed-lh: 1.7;
 }
 
 [data-theme="dark"] {
@@ -406,6 +413,64 @@ button.danger:hover { background: var(--danger-soft); }
 }
 .more-menu button:hover { background: var(--bg-hover); border-color: transparent; }
 
+/* ---------------- 编辑区外观（字体 / 字号 / 行距） ---------------- */
+.type-wrap { position: relative; }
+.type-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  width: 280px;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+}
+.type-panel[hidden] { display: none; }
+.type-row { margin-top: 10px; }
+.type-row:first-child { margin-top: 0; }
+.type-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.type-label b { color: var(--fg); font-weight: 600; }
+.type-select {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font-size: 12.5px;
+}
+.type-custom { display: flex; gap: 4px; margin-top: 6px; }
+.type-custom-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font-size: 12px;
+}
+.type-custom-input:focus { outline: none; border-color: var(--accent); }
+.type-custom button { font-size: 12px; }
+.type-panel input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.type-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+.type-foot button { font-size: 12px; color: var(--fg-muted); }
+
 /* ---------------- 编辑 / 预览 ---------------- */
 .panes {
   flex: 1;
@@ -427,9 +492,9 @@ button.danger:hover { background: var(--danger-soft); }
   resize: none;
   outline: none;
   background: var(--bg);
-  font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.7;
+  font-family: var(--ed-font);
+  font-size: var(--ed-size);
+  line-height: var(--ed-lh);
   tab-size: 2;
 }
 
@@ -438,6 +503,9 @@ button.danger:hover { background: var(--danger-soft); }
   overflow: auto;
   padding: 16px 22px 40px;
   background: var(--bg);
+  font-family: var(--ed-font);
+  font-size: var(--ed-size);
+  line-height: var(--ed-lh);
 }
 
 .empty {
@@ -1034,11 +1102,11 @@ button.danger:hover { background: var(--danger-soft); }
   line-height: 1.3;
   font-weight: 600;
 }
-.markdown-body h1 { font-size: 24px; padding-bottom: .3em; border-bottom: 1px solid var(--border-soft); }
-.markdown-body h2 { font-size: 19px; padding-bottom: .3em; border-bottom: 1px solid var(--border-soft); }
-.markdown-body h3 { font-size: 16px; }
-.markdown-body h4 { font-size: 14px; }
-.markdown-body h5, .markdown-body h6 { font-size: 13px; color: var(--fg-muted); }
+.markdown-body h1 { font-size: 1.85em; padding-bottom: .3em; border-bottom: 1px solid var(--border-soft); }
+.markdown-body h2 { font-size: 1.45em; padding-bottom: .3em; border-bottom: 1px solid var(--border-soft); }
+.markdown-body h3 { font-size: 1.2em; }
+.markdown-body h4 { font-size: 1.05em; }
+.markdown-body h5, .markdown-body h6 { font-size: 1em; color: var(--fg-muted); }
 
 .markdown-body p { margin: .7em 0; }
 .markdown-body ul, .markdown-body ol { margin: .6em 0; padding-left: 1.6em; }
