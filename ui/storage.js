@@ -919,6 +919,12 @@
     setPrefs: function (prefs) {
       return rpc("ui/setPrefs", { prefs: prefs || {} }, RPC_TIMEOUT).catch(function () { return null; });
     },
+    /** 本机已安装字体的族名。沙箱读不到字体目录，只能问侧车；失败返回空数组。 */
+    listFonts: function () {
+      return rpc("ui/listFonts", {}, RPC_TIMEOUT)
+        .then(function (r) { return (r && r.fonts) || []; })
+        .catch(function () { return []; });
+    },
 
     /** 宿主是否提供「另存为」对话框（决定导出/备份能否让用户自选目录） */
     hasHostSave: hasHostSave,

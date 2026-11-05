@@ -29,7 +29,7 @@ const path = require("path");
 const crypto = require("crypto");
 const zlib = require("zlib");
 
-const root = "D:/core/web/dbx-pj/dbx-md-notes/";
+const root = path.resolve(__dirname) + path.sep;
 const binary = "dbx-plugin-mdnotes";       // 与 dbx-plugin.toml [backend].binary 一致
 
 const argv = process.argv.slice(2);
