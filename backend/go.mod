@@ -1,9 +1,17 @@
-// MD 笔记 —— DBX 插件侧车模块
-//
-// 依赖策略：零外部依赖。
-// 官方 SDK 未发布到 Go 模块代理（go get 报 unknown revision），且其 go.mod 声明 go 1.22，
-// 独立引入会让低版本工具链无法构建；因此把官方 sdk.go 原样 vendor 为 ./dbxsdk 包，
-// 与本模块一起编译，仅需 Go 1.20+，且离线可构建。
 module github.com/lwai/mdnotes
 
-go 1.20
+go 1.21
+
+require modernc.org/sqlite v1.34.5
+
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/ncruces/go-strftime v0.1.9 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	golang.org/x/sys v0.22.0 // indirect
+	modernc.org/libc v1.55.3 // indirect
+	modernc.org/mathutil v1.6.0 // indirect
+	modernc.org/memory v1.8.0 // indirect
+)

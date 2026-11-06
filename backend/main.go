@@ -38,7 +38,7 @@ import (
 // 必须与 manifest.json 的 id / version 完全一致，否则宿主判定 Sidecar 身份不匹配并丢弃。
 const (
 	pluginID      = "com.lwai.mdnotes"
-	pluginVersion = "0.8.12" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
+	pluginVersion = "0.8.14" // 仅作兜底；运行时以包内 manifest.json 的版本为准（见 resolveMetadata）
 )
 
 type plugin struct {
@@ -201,12 +201,27 @@ func (plugin *plugin) Handle(
 		if len(p.Data) == 0 {
 			return nil, badParams("missing data")
 		}
-		if err := saveNotes(p.Data); err != nil {
+		rev, conflict, err := saveNotes(p.Data)
+		if conflict != nil {
+			sidecarTrace(fmt.Sprintf("notes/save CONFLICT dir=%s baseRev=%d currentRev=%d changed=%d",
+				notesDir(), conflict.BaseRev, conflict.CurrentRev, len(conflict.Changed)))
+			return map[string]any{
+				"ok":         false,
+				"conflict":   true,
+				"message":    "笔记已被另一个窗口/实例修改，本次保存已阻止。请重新载入后再编辑，避免覆盖对方的内容。",
+				"baseRev":    conflict.BaseRev,
+				"currentRev": conflict.CurrentRev,
+				"changed":    conflict.Changed,
+				"path":       metaPath(),
+				"dir":        notesDir(),
+			}, nil
+		}
+		if err != nil {
 			sidecarTrace(fmt.Sprintf("notes/save FAILED dir=%s bytes=%d err=%v", notesDir(), len(p.Data), err))
 			return nil, failed(-32002, fmt.Errorf("save failed: %w", err))
 		}
-		sidecarTrace(fmt.Sprintf("notes/save ok dir=%s bytes=%d", notesDir(), len(p.Data)))
-		return map[string]any{"ok": true, "path": metaPath(), "dir": notesDir()}, nil
+		sidecarTrace(fmt.Sprintf("notes/save ok dir=%s bytes=%d rev=%d", notesDir(), len(p.Data), rev))
+		return map[string]any{"ok": true, "rev": rev, "path": metaPath(), "dir": notesDir()}, nil
 
 	case "notes/putAsset":
 		// 粘贴/拖入的图片：前端压缩后把字节交给侧车，落成 <storage_dir>/assets/<名字>。
@@ -377,8 +392,11 @@ func dataDir() string {
 	return filepath.Join(".", "data")
 }
 
-func metaDir() string  { return filepath.Join(notesDir(), ".mdnotes") }
-func metaPath() string { return filepath.Join(metaDir(), "meta.json") }
+func metaDir() string { return filepath.Join(notesDir(), ".mdnotes") }
+
+// metaPath 对外回报「索引文件路径」。v3 起索引是 SQLite，返回 .db；
+// 旧 meta.json 仅由 store.go 的 legacyMetaPath 在一次性迁移时读取。
+func metaPath() string { return dbPath() }
 
 // sidecarTrace 追加一行诊断记录到 <dataDir>/sidecar-trace.log（best-effort，永不阻断业务）。
 //
@@ -647,7 +665,7 @@ func tryMigrate() {
 		if json.Unmarshal(b, &s) != nil || len(s.Nodes) == 0 {
 			continue
 		}
-		if err := saveNotes(b); err != nil {
+		if _, _, err := saveNotes(b); err != nil {
 			continue
 		}
 		_ = os.Rename(old, old+".migrated")
@@ -665,6 +683,9 @@ type MetaNode struct {
 	CreatedAt string  `json:"createdAt,omitempty"`
 	UpdatedAt string  `json:"updatedAt,omitempty"`
 	File      string  `json:"file"` // 相对存储目录的路径：笔记 "x.md"，文件夹 "x"
+	// 版本与状态由 SQLite 维护，随 notes/load 下发给前端做乐观锁。
+	Version int64  `json:"version,omitempty"` // 该节点被编辑的次数（新建为 1）
+	State   string `json:"state,omitempty"`   // created | edited | migrated | active
 }
 
 type Meta struct {
@@ -673,37 +694,10 @@ type Meta struct {
 	ActiveID string          `json:"activeId,omitempty"`
 	Expanded map[string]bool `json:"expanded,omitempty"`
 	View     string          `json:"view,omitempty"`
-}
-
-func loadMeta() Meta {
-	b, err := os.ReadFile(metaPath())
-	if err != nil {
-		return Meta{Version: 2, Nodes: []MetaNode{}}
-	}
-	var m Meta
-	if json.Unmarshal(b, &m) != nil {
-		return Meta{Version: 2, Nodes: []MetaNode{}}
-	}
-	if m.Nodes == nil {
-		m.Nodes = []MetaNode{}
-	}
-	return m
-}
-
-func metaExists() bool {
-	_, err := os.Stat(metaPath())
-	return err == nil
-}
-
-func saveMeta(m Meta) error {
-	if m.Version == 0 {
-		m.Version = 2
-	}
-	b, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeAtomic(metaPath(), b)
+	Rev      int64           `json:"rev,omitempty"` // 全局修订号（每次写入 +1）
+	// Dirty 是本次保存中「正文真的变了」的节点 id 集合。正文不入库，
+	// 靠它让 SQLite 递增对应节点的 version。不参与序列化。
+	Dirty map[string]bool `json:"-"`
 }
 
 // ---------------- 文件名工具 ----------------
@@ -840,6 +834,10 @@ type snap struct {
 	ActiveID   string          `json:"activeId"`
 	Expanded   map[string]bool `json:"expanded"`
 	View       string          `json:"view"`
+	// BaseRev 是前端上次 notes/load 拿到的全局修订号。带上它即启用乐观锁：
+	// 期间若有别的实例写过，本次保存会被整体拒绝并返回冲突详情。
+	// 旧前端 / 测试探针不带该字段（nil）时退化为无锁写入，保持兼容。
+	BaseRev *int64 `json:"baseRev"`
 }
 
 // computeRelPath 由父子链推导相对路径（文件名已 sanitize）。
@@ -873,20 +871,137 @@ func trashPath(root, rel string) string {
 	return filepath.Join(root, ".mdnotes", "trash", stamp, rel)
 }
 
-func saveNotes(raw json.RawMessage) error {
+// ---------------- 已删除笔记的索引自愈 ----------------
+//
+// 症状：左下角统计把早已删掉的笔记算进去，备份包里也带出一堆同名（且为空）的 .md。
+// 根因：索引里残留着「正文文件已不在原位」的节点（旧 meta.json 迁移、外部删文件、
+// 或某次删除没能同步索引都可能留下）。notes/load 对读不到正文的节点只标
+// contentMissing 并冻结、从不清理，于是空壳节点被后续 save 一次次带回索引；
+// 备份时 os.ReadFile 失败又写成空的 .md 条目打进包里。
+//
+// 判死必须保守，只清理【确证被删除】的：
+//   1) File 落在插件内部目录（.mdnotes / assets）、为空或越界 —— 不可能是用户笔记；
+//   2) 正文不在原位，但回收站里能找到同一相对路径 —— 是插件自己移走的。
+// 正文读不到、回收站里也找不到的（外部改名 / 文件占用 / 网络盘抖动）一律保留，
+// 继续按 contentMissing 冻结，绝不悄悄把用户的笔记弄丢。
+//
+// 这里只做【读时过滤】，不额外开写事务：下一次 notes/save 的 result 里没有这些节点，
+// writeTx.commit 会自然把它们从 nodes 表删掉，完成一次自愈。
+
+// trashedRels 收集回收站里所有被删文件的「原相对路径」（去掉 <时间戳>/ 前缀）。
+func trashedRels(root string) map[string]bool {
+	out := map[string]bool{}
+	batches, err := os.ReadDir(filepath.Join(root, ".mdnotes", "trash"))
+	if err != nil {
+		return out
+	}
+	for _, b := range batches {
+		if !b.IsDir() {
+			continue
+		}
+		batch := filepath.Join(root, ".mdnotes", "trash", b.Name())
+		_ = filepath.WalkDir(batch, func(p string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() {
+				return nil
+			}
+			rel, e := filepath.Rel(batch, p)
+			if e == nil {
+				out[filepath.ToSlash(rel)] = true
+			}
+			return nil
+		})
+	}
+	return out
+}
+
+func isInternalNoteRel(rel string) bool {
+	rel = strings.TrimSpace(filepath.ToSlash(rel))
+	if rel == "" || filepath.IsAbs(rel) {
+		return true
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return rel == ".mdnotes" || strings.HasPrefix(rel, ".mdnotes/") ||
+		rel == "assets" || strings.HasPrefix(rel, "assets/")
+}
+
+// liveMeta 剔除确证已删除的 note 节点，返回过滤后的 Meta 与被剔除的 id 集合。
+// 所有「面向用户 / 面向备份」的入口都走它，保证统计与备份看到的是同一份有效索引。
+func liveMeta(m Meta) (Meta, map[string]bool) {
+	root := notesDir()
+	dead := map[string]bool{}
+	var missing []MetaNode
+	for _, n := range m.Nodes {
+		if n.Type != "note" {
+			continue
+		}
+		if isInternalNoteRel(n.File) {
+			dead[n.ID] = true
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(n.File))); err != nil {
+			missing = append(missing, n)
+		}
+	}
+	// 只有确实有正文缺失时才扫回收站：正常库零额外遍历。
+	if len(missing) > 0 {
+		trash := trashedRels(root)
+		for _, n := range missing {
+			if trash[filepath.ToSlash(n.File)] {
+				dead[n.ID] = true
+			}
+		}
+	}
+	if len(dead) == 0 {
+		return m, dead
+	}
+	kept := make([]MetaNode, 0, len(m.Nodes)-len(dead))
+	for _, n := range m.Nodes {
+		if !dead[n.ID] {
+			kept = append(kept, n)
+		}
+	}
+	m.Nodes = kept
+	sidecarTrace(fmt.Sprintf("索引自愈：过滤掉 %d 条已删除的笔记节点（下次保存会真正从 SQLite 清掉）", len(dead)))
+	return m, dead
+}
+
+// loadLiveMeta 是 main.go 侧读索引的统一入口（store.go 内部的 loadMeta 保持原始语义）。
+func loadLiveMeta() Meta {
+	m, _ := liveMeta(loadMeta())
+	return m
+}
+
+func saveNotes(raw json.RawMessage) (int64, *conflictInfo, error) {
 	var s snap
 	if err := json.Unmarshal(raw, &s); err != nil {
-		return err
+		return 0, nil, err
 	}
 	if s.Nodes == nil {
 		s.Nodes = []snapNode{}
 	}
 	root := notesDir()
 	if err := os.MkdirAll(metaDir(), 0o755); err != nil {
-		return err
+		return 0, nil, err
 	}
 
-	prev := loadMeta()
+	// 先在锁外读一次旧索引（写盘要用到旧 File 路径）。
+	// 随后 beginWriteTx 会用 baseRev 做 CAS：若期间别的实例写过，rev 已变，
+	// 本次保存会被整体拒绝，因此这里读到的 prev 过期也无害。
+	prev := loadLiveMeta()
+
+	// 拿 SQLite 写锁 + 乐观锁检查。冲突时【立即返回】，绝不碰磁盘。
+	tx, conflict, err := beginWriteTx(s.BaseRev)
+	if conflict != nil {
+		return 0, conflict, nil
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	defer tx.done()
 	prevByID := map[string]MetaNode{}
 	for _, n := range prev.Nodes {
 		prevByID[n.ID] = n
@@ -936,6 +1051,8 @@ func saveNotes(raw json.RawMessage) error {
 	}
 
 	// 2) 笔记：新建/移动文件 + 仅内容变化时写盘
+	// dirty 记录正文真的被改写过的节点：正文不入库，靠它让 SQLite 递增节点 version。
+	dirty := map[string]bool{}
 	result := []MetaNode{}
 	for _, n := range s.Nodes {
 		if n.Type != "note" || deletedSet[n.ID] {
@@ -959,8 +1076,9 @@ func saveNotes(raw json.RawMessage) error {
 			hs := contentHash(*n.Content)
 			if !isUnchanged(absTarget, hs) {
 				if err := writeContent(absTarget, *n.Content); err != nil {
-					return err
+					return 0, nil, err
 				}
+				dirty[n.ID] = true
 			}
 		}
 		result = append(result, mn)
@@ -1003,17 +1121,26 @@ func saveNotes(raw json.RawMessage) error {
 		sidecarTrace(fmt.Sprintf("notes/save preserved=%d（快照里没带、但未声明删除，保持原样）", preserved))
 	}
 
-	newMeta := Meta{Version: s.Version, ActiveID: s.ActiveID, Expanded: s.Expanded, View: s.View, Nodes: result}
-	return saveMeta(newMeta)
+	newMeta := Meta{
+		Version: s.Version, ActiveID: s.ActiveID, Expanded: s.Expanded,
+		View: s.View, Nodes: result, Dirty: dirty,
+	}
+	rev, err := tx.commit(newMeta)
+	return rev, nil, err
 }
 
 func notesLoad() (any, *dbxpluginsdk.PluginError) {
 	tryMigrate()
-	m := loadMeta()
-	if len(m.Nodes) == 0 && !metaExists() {
+	// 首次运行判定必须用 storeHasData()（看「有没有真正写过索引」），
+	// 不能用 metaExists()（看文件在不在）：SQLite 版 loadMeta() 会建空库，
+	// 连 notes/reconcile 都会先建库，文件存在就判成已有数据会漏掉示例笔记。
+	hadStore := storeHasData()
+	m := loadLiveMeta()
+	if len(m.Nodes) == 0 && !hadStore {
 		// 首次运行：还没有任何数据，让前端去放示例笔记
 		return map[string]any{
 			"data":       nil,
+			"rev":        m.Rev,
 			"path":       metaPath(),
 			"dir":        notesDir(),
 			"ok":         true,
@@ -1030,6 +1157,8 @@ func notesLoad() (any, *dbxpluginsdk.PluginError) {
 			"parentId":  mn.ParentID,
 			"createdAt": mn.CreatedAt,
 			"updatedAt": mn.UpdatedAt,
+			"version":   mn.Version,
+			"state":     mn.State,
 		}
 		if mn.Type == "note" {
 			if data, err := os.ReadFile(filepath.Join(notesDir(), mn.File)); err == nil {
@@ -1048,11 +1177,13 @@ func notesLoad() (any, *dbxpluginsdk.PluginError) {
 	return map[string]any{
 		"data": map[string]any{
 			"version":  m.Version,
+			"rev":      m.Rev,
 			"nodes":    nodes,
 			"activeId": m.ActiveID,
 			"expanded": m.Expanded,
 			"view":     m.View,
 		},
+		"rev":        m.Rev,
 		"path":       metaPath(),
 		"dir":        notesDir(),
 		"ok":         true,
@@ -1084,7 +1215,7 @@ func reconcileNotes() (any, *dbxpluginsdk.PluginError) {
 	}
 	root := notesDir()
 
-	m := loadMeta()
+	m := loadLiveMeta()
 	existingFiles := map[string]bool{}
 	folderByRel := map[string]string{}
 	taken := map[string]bool{}
@@ -1208,7 +1339,7 @@ func exportNote(id string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
 	if id == "" {
 		return nil, badParams("missing id")
 	}
-	m := loadMeta()
+	m := loadLiveMeta()
 	var node *MetaNode
 	for i := range m.Nodes {
 		if m.Nodes[i].ID == id && m.Nodes[i].Type == "note" {
@@ -1267,13 +1398,17 @@ func subtreeIDs(m Meta, rootID string) map[string]bool {
 //
 // 包内布局与磁盘布局 1:1，所以恢复就是一次朴素复制，不需要任何映射表：
 //
-//	mdnotes-backup.json    备份元信息（版本 / 导出时间 / 当时的存储目录 / 计数）
-//	.mdnotes/meta.json     目录树索引（结构、名称、展开状态）
-//	<真实 .md 相对路径>     正文，与 meta.json 的 file 字段逐字对应
+//	mdnotes-backup.json     备份元信息（版本 / 导出时间 / 当时的存储目录 / 计数）
+//	.mdnotes/index.json     目录树索引快照（结构、名称、展开状态、节点 version/state）
+//	<真实 .md 相对路径>      正文，与索引的 file 字段逐字对应
 //
 // 只备份正文而不备份索引，恢复出来就是一堆没有名字和层级的孤儿文件 —— 所以索引必须随包走。
+// v3 起索引在 SQLite 里，但备份包放【可移植的 JSON 快照】而不是 .db 二进制：
+// 跨版本/跨平台可读、不绑定 schema 与 WAL 状态，恢复端导入 DB 即可。
+// 旧备份包里的 .mdnotes/meta.json 仍能被恢复端识别（见 restoreNotes）。
 const backupInfoName = "mdnotes-backup.json"
-const backupMetaEntry = ".mdnotes/meta.json"
+const backupIndexEntry = ".mdnotes/index.json"
+const backupMetaEntryLegacy = ".mdnotes/meta.json"
 
 // backupInfo 是随备份包一起走的「配置」，供恢复时确认这份包从哪来、能不能用。
 type backupInfo struct {
@@ -1299,7 +1434,7 @@ func buildBackupZip(root string, m Meta, notes []MetaNode, folders int, scope st
 	zw := zip.NewWriter(&writerCapture{&sb})
 
 	info := backupInfo{
-		Schema:     "dbx-md-notes/backup@1",
+		Schema:     "dbx-md-notes/backup@2",
 		PluginID:   pluginID,
 		Version:    resolveMetadata().Version,
 		ExportedAt: time.Now().Format(time.RFC3339),
@@ -1308,22 +1443,27 @@ func buildBackupZip(root string, m Meta, notes []MetaNode, folders int, scope st
 		Notes:      len(notes),
 		Folders:    folders,
 		Assets:     len(assets),
-		MetaFile:   backupMetaEntry,
+		MetaFile:   backupIndexEntry,
 	}
 	if b, e := json.MarshalIndent(info, "", "  "); e == nil {
 		if w, e2 := zw.Create(backupInfoName); e2 == nil {
 			_, _ = w.Write(b)
 		}
 	}
-	if b, e := os.ReadFile(metaPath()); e == nil {
-		if w, e2 := zw.Create(backupMetaEntry); e2 == nil {
+	// 索引快照只导出逻辑数据（节点 / UI 状态 / rev / 每节点 version），
+	// 不碰 SQLite 文件本身。恢复端会把它导入当前库。
+	if b, e := json.MarshalIndent(m, "", "  "); e == nil {
+		if w, e2 := zw.Create(backupIndexEntry); e2 == nil {
 			_, _ = w.Write(b)
 		}
 	}
 	for _, n := range notes {
 		data, err := os.ReadFile(filepath.Join(root, n.File))
 		if err != nil {
-			data = []byte("")
+			// 正文已经不在磁盘上（已删除 / 外部移动）：绝不写一条空的 .md 进包。
+			// 否则备份里会凭空多出一篇同名空笔记，恢复时还会把它当成真笔记写回磁盘。
+			sidecarTrace(fmt.Sprintf("notes/backup 跳过读不到正文的笔记：rel=%s err=%v", n.File, err))
+			continue
 		}
 		// zip 条目名一律用正斜杠（zip 规范），Windows 的 filepath.Join 会给出反斜杠。
 		w, e := zw.Create(filepath.ToSlash(n.File))
@@ -1432,7 +1572,7 @@ func backupFileName(m Meta, scope string) string {
 // backupNotes 构造备份包。toDisk=false（默认）把字节交回前端，由宿主的原生「另存为」
 // 对话框落盘（用户可自选目录）；toDisk=true 则写进笔记存储目录并回显路径（兜底）。
 func backupNotes(scope string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
-	m := loadMeta()
+	m := loadLiveMeta()
 	root := notesDir()
 
 	var inc map[string]bool
@@ -1440,24 +1580,35 @@ func backupNotes(scope string, toDisk bool) (any, *dbxpluginsdk.PluginError) {
 		inc = subtreeIDs(m, scope)
 	}
 	var notes []MetaNode
+	exportNodes := make([]MetaNode, 0, len(m.Nodes))
 	folders := 0
 	for _, n := range m.Nodes {
 		if scope != "" && !inc[n.ID] {
 			continue
 		}
 		if n.Type == "note" {
+			// 正文已经不在磁盘上的（已删除 / 被外部移走）一律不进备份：
+			// 既不能让包里多出同名空 .md，也不能把节点写进 index.json 让它在恢复时「复活」，
+			// 更不能让「包含 N 篇笔记」的回显数字虚高。
+			if _, err := os.Stat(filepath.Join(root, n.File)); err != nil {
+				continue
+			}
 			notes = append(notes, n)
 		} else {
 			folders++
 		}
+		exportNodes = append(exportNodes, n)
 	}
 	if len(notes) == 0 && folders == 0 {
 		return nil, failed(-32005, fmt.Errorf("nothing to backup"))
 	}
+	// 索引快照必须与包内正文严格一致：只写这次真正打包进去的节点。
+	exportMeta := m
+	exportMeta.Nodes = exportNodes
 
 	// 整库备份带全部图片；只备份某个文件夹/单篇时，只带被这些正文引用到的图。
 	assets := assetsForNotes(root, notes, scope == "")
-	buf := buildBackupZip(root, m, notes, folders, scope, assets)
+	buf := buildBackupZip(root, exportMeta, notes, folders, scope, assets)
 	if len(buf) == 0 {
 		return nil, failed(-32005, fmt.Errorf("nothing to backup"))
 	}
@@ -1558,6 +1709,8 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 		asset   bool
 	}
 	var items []item
+	// 新格式 index.json 优先；旧格式 meta.json 兜底（用户手里的老备份必须能恢复）。
+	var indexBytes []byte
 	var metaBytes []byte
 	var info backupInfo
 	var total uint64
@@ -1591,13 +1744,18 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 				_ = json.Unmarshal(b, &info)
 			}
 			continue // 元信息只用于回显，不落盘
-		case backupMetaEntry:
+		case backupIndexEntry, backupMetaEntryLegacy:
 			rc, e := f.Open()
 			if e != nil {
 				return nil, failed(-32006, fmt.Errorf("read backup index: %w", e))
 			}
-			metaBytes, _ = io.ReadAll(io.LimitReader(rc, int64(maxFile)))
+			b, _ := io.ReadAll(io.LimitReader(rc, int64(maxFile)))
 			_ = rc.Close()
+			if rel == backupIndexEntry {
+				indexBytes = b
+			} else {
+				metaBytes = b
+			}
 			continue
 		}
 		// assets/ 是插件的保留目录（只放图片），**必须先判**：
@@ -1623,11 +1781,16 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 		items = append(items, item{zipName: f.Name, rel: rel})
 	}
 
-	if len(metaBytes) == 0 {
-		return nil, badParams("这不是「MD 笔记」的备份包（缺少 %s）", backupMetaEntry)
+	chosen := indexBytes
+	if len(chosen) == 0 {
+		chosen = metaBytes // 兼容 backup@1 老包
+	}
+	if len(chosen) == 0 {
+		return nil, badParams("这不是「MD 笔记」的备份包（缺少 %s 或 %s）",
+			backupIndexEntry, backupMetaEntryLegacy)
 	}
 	var bm Meta
-	if err := json.Unmarshal(metaBytes, &bm); err != nil {
+	if err := json.Unmarshal(chosen, &bm); err != nil {
 		return nil, badParams("备份包里的索引已损坏：%v", err)
 	}
 	// 备份可能来自另一个操作系统：索引里的路径分隔符按当前平台归一化，
@@ -1643,11 +1806,7 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 			migrated = true
 		}
 	}
-	if migrated {
-		if b, e := json.MarshalIndent(bm, "", "  "); e == nil {
-			metaBytes = b
-		}
-	}
+	_ = migrated // 路径已就地归一化，导入 DB 时直接用 bm
 	notes, folders := 0, 0
 	for _, n := range bm.Nodes {
 		if n.Type == "note" {
@@ -1663,14 +1822,14 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 			"files": len(items), "notes": notes, "folders": folders,
 			"assets": assetEntries, "assetEntries": assetEntries,
 			"filesScanned": len(items),
-			"storageDir":  root,
+			"storageDir":   root,
 		}, nil
 	}
 
 	// 覆盖前先把当前状态存一份，恢复错了能退回去。
 	safety := ""
 	if metaExists() {
-		cur := loadMeta()
+		cur := loadLiveMeta()
 		var cnotes []MetaNode
 		cf := 0
 		for _, n := range cur.Nodes {
@@ -1727,11 +1886,11 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 		}
 	}
 
-	// 索引最后写：正文全就位了再切换索引，中途失败至少不会出现「索引指向不存在的文件」。
-	if err := os.MkdirAll(metaDir(), 0o755); err != nil {
-		return nil, failed(-32006, fmt.Errorf("create meta dir: %w", err))
-	}
-	if err := writeAtomic(metaPath(), metaBytes); err != nil {
+	// 索引最后写：正文全就位了再导入 SQLite，中途失败至少不会出现「索引指向不存在的文件」。
+	// 恢复是整库权威替换，跳过 CAS；rev 由 beginWriteTx 继续递增，绝不回退到备份里的旧值
+	// （否则另一个实例手里的 baseRev 可能恰好等于旧值，绕过乐观锁）。
+	newRev, err := restoreIndex(bm)
+	if err != nil {
 		return nil, failed(-32006, fmt.Errorf("restore index: %w", err))
 	}
 
@@ -1740,11 +1899,11 @@ func restoreNotes(dataBase64 string, dryRun bool) (any, *dbxpluginsdk.PluginErro
 	contentHashes = map[string]string{}
 	hashMu.Unlock()
 
-	sidecarTrace(fmt.Sprintf("notes/restore ok dir=%s files=%d notes=%d assets=%d safety=%s",
-		root, written, notes, assetsWritten, safety))
+	sidecarTrace(fmt.Sprintf("notes/restore ok dir=%s files=%d notes=%d assets=%d safety=%s rev=%d",
+		root, written, notes, assetsWritten, safety, newRev))
 	return map[string]any{
-		"ok": true, "files": written, "notes": notes, "folders": folders,
-		"assets": assetsWritten,
+		"ok": true, "rev": newRev, "files": written, "notes": notes, "folders": folders,
+		"assets":     assetsWritten,
 		"storageDir": root, "safetyPath": safety, "backup": info,
 	}, nil
 }
@@ -2064,7 +2223,7 @@ func parentIDOf(rel string) *string {
 		return nil
 	}
 	root := notesDir()
-	m := loadMeta()
+	m := loadLiveMeta()
 	for i := range m.Nodes {
 		if m.Nodes[i].File == d {
 			id := m.Nodes[i].ID
@@ -2081,7 +2240,7 @@ func nameFromFile(rel string) string {
 }
 
 func syncMetaFile(rel, content string) {
-	m := loadMeta()
+	m := loadLiveMeta()
 	found := false
 	for i := range m.Nodes {
 		if m.Nodes[i].File == rel && m.Nodes[i].Type == "note" {
@@ -2108,7 +2267,7 @@ func syncMetaFile(rel, content string) {
 }
 
 func syncMetaDir(rel string) {
-	m := loadMeta()
+	m := loadLiveMeta()
 	for i := range m.Nodes {
 		if m.Nodes[i].File == rel && m.Nodes[i].Type == "folder" {
 			m.Nodes[i].Name = filepath.Base(rel)
@@ -2128,7 +2287,7 @@ func syncMetaDir(rel string) {
 }
 
 func removeMetaUnder(rel string, isDir bool) {
-	m := loadMeta()
+	m := loadLiveMeta()
 	kept := m.Nodes[:0]
 	for _, n := range m.Nodes {
 		if isDir {
@@ -2147,7 +2306,7 @@ func removeMetaUnder(rel string, isDir bool) {
 }
 
 func renameMeta(srcRel, dstRel string) {
-	m := loadMeta()
+	m := loadLiveMeta()
 	for i := range m.Nodes {
 		if m.Nodes[i].File == srcRel {
 			m.Nodes[i].File = dstRel

@@ -395,7 +395,7 @@ func TestRestoreIgnoresNonImageUnderAssets(t *testing.T) {
 	}})
 
 	zipBytes := craftZip(t, map[string][]byte{
-		backupMetaEntry:          mustRead(t, metaPath()),
+		backupIndexEntry:         indexSnapshot(t),
 		"assets/ok.png":          fakeImg("ok"),
 		"assets/evil.exe":        []byte("MZ fake binary"),
 		"assets/sneaky.md":       []byte("# 假装是笔记"),
@@ -427,7 +427,7 @@ func TestRestoreRejectsOversizedAsset(t *testing.T) {
 
 	big := make([]byte, maxAssetBytes+1024)
 	zipBytes := craftZip(t, map[string][]byte{
-		backupMetaEntry:  mustRead(t, metaPath()),
+		backupIndexEntry: indexSnapshot(t),
 		"assets/big.png": big,
 	})
 	if _, perr := callRaw(t, "notes/restore", map[string]any{

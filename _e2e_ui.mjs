@@ -328,8 +328,8 @@ check("落盘目录来自侧车", st.storageDir === STORAGE_DIR, "storageDir=" +
 check("dirConfigured=true", st.dirConfigured === true);
 
 /* ---------- 5) 真的落盘了 ---------- */
-const meta = path.join(STORAGE_DIR, ".mdnotes/meta.json");
-check("meta.json 已落盘", fs.existsSync(meta), meta);
+const meta = path.join(STORAGE_DIR, ".mdnotes/notes.db");
+check("SQLite 索引 notes.db 已落盘", fs.existsSync(meta), meta);
 const mdFiles = [];
 (function walk(d) {
   for (const e of fs.readdirSync(d, { withFileTypes: true })) {
@@ -535,7 +535,7 @@ check("备份 zip 落在「用户所选目录」",
 if (bkCall && fs.existsSync(bkCall.path)) {
   const names = zipEntries(fs.readFileSync(bkCall.path));
   check("备份包含配置 mdnotes-backup.json", names.includes("mdnotes-backup.json"), names.join(", "));
-  check("备份包含目录树索引 .mdnotes/meta.json", names.includes(".mdnotes/meta.json"));
+  check("备份包含目录树索引 .mdnotes/index.json", names.includes(".mdnotes/index.json"));
   check("备份条目名用正斜杠", !names.some((n) => n.includes("\\")));
   check("备份成功后弹窗说明了「含配置」与如何恢复",
     $("modal").hidden === false && /含配置|恢复/.test($("modal").textContent),
@@ -586,11 +586,10 @@ if (bkCall && fs.existsSync(bkCall.path)) {
       [...doc.querySelectorAll("#tree .node")].some((el) => el.textContent.includes(goodName)),
       "期望含 " + JSON.stringify(goodName)
         + " · 树=[" + [...doc.querySelectorAll("#tree .node")].map((e) => e.textContent).join(" | ") + "]"
-        + " · 磁盘meta节点=" + (() => {
+        + " · 索引DB=" + (() => {
           try {
-            const m = JSON.parse(fs.readFileSync(path.join(STORAGE_DIR, ".mdnotes/meta.json"), "utf8"));
-            return m.nodes.map((n) => n.type + ":" + n.name).join(" | ");
-          } catch (e) { return "(读不到 meta: " + e.message + ")"; }
+            return fs.statSync(path.join(STORAGE_DIR, ".mdnotes/notes.db")).size + "B";
+          } catch (e) { return "(读不到 notes.db: " + e.message + ")"; }
         })()
         + " · 磁盘文件=" + (function w(d, pre = "") {
           return fs.readdirSync(d, { withFileTypes: true }).map((e) =>

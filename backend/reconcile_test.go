@@ -10,7 +10,7 @@ import (
  * 打开应用自动归位（notes/reconcile）
  * ------------------------------------------------------------
  * 事故背景：用户在存储目录里手动丢 / 拷贝 .md 文件、或从别处迁移进来的库，
- * 这些文件在磁盘上真实存在、却没登记进 .mdnotes/meta.json 索引 ——
+ * 这些文件在磁盘上真实存在、却没登记进 SQLite 索引 notes.db ——
  * 于是「打开应用」时这些笔记「凭空消失」看不到。
  * reconcile 在启动时扫描存储目录，把真实存在的 .md 按所在目录层级自动补登进索引。
  * ============================================================ */
@@ -55,7 +55,7 @@ func TestReconcileAddsOrphanNotesByLocation(t *testing.T) {
 	dir := t.TempDir()
 	setDir(dir)
 
-	// 先只登记一篇索引笔记（这会真实写出「A笔记.md」+ meta.json）
+	// 先只登记一篇索引笔记（这会真实写出「A笔记.md」+ notes.db）
 	call(t, "notes/save", map[string]any{"storage_dir": dir, "data": map[string]any{
 		"version":  2,
 		"activeId": "a",

@@ -351,9 +351,9 @@ function check(name, cond, extra) {
   check("save 返回成功", ok === true, "ok=" + ok + " lastError=" + S.status().lastError);
 
   const file = path.join(STORAGE_DIR, "工作/重构验证.md");
-  const meta = path.join(STORAGE_DIR, ".mdnotes/meta.json");
+  const meta = path.join(STORAGE_DIR, ".mdnotes/notes.db");
   check("真实 .md 文件已落盘", fs.existsSync(file), file);
-  check("meta.json 已落盘", fs.existsSync(meta), meta);
+  check("SQLite 索引 notes.db 已落盘", fs.existsSync(meta), meta);
   if (fs.existsSync(file)) {
     const text = fs.readFileSync(file, "utf8");
     check("笔记内容正确", text.includes("存储链路已打通"), JSON.stringify(text.slice(0, 40)));
@@ -391,7 +391,7 @@ function check(name, cond, extra) {
   // 备份包里必须同时有「配置」和「目录树索引」，否则恢复出来只是一堆孤儿文件
   const names = zipEntries(fs.readFileSync(zipPath));
   check("备份包含配置 mdnotes-backup.json", names.includes("mdnotes-backup.json"), names.join(", "));
-  check("备份包含目录树索引 .mdnotes/meta.json", names.includes(".mdnotes/meta.json"));
+  check("备份包含目录树索引 .mdnotes/index.json", names.includes(".mdnotes/index.json"));
   check("备份包含正文", names.some((n) => n.endsWith("重构验证.md")));
   check("备份条目名用正斜杠（不是 Windows 反斜杠）", !names.some((n) => n.includes("\\")));
 
@@ -464,13 +464,47 @@ function check(name, cond, extra) {
   const otherFile = path.join(STORAGE_DIR, otherRel);
   check("另一实例写入的笔记已落盘", fs.existsSync(otherFile), otherFile);
 
-  await S.save(baseSnap, false);
+  // 乐观锁：本实例手里还是写入前的 rev，直接保存必须被拒绝，
+  // 且对方新写的笔记不能被动过。
+  const staleSave = await S.save(baseSnap, false);
+  check("过期 rev 的保存被乐观锁拒绝", staleSave === false, "S.save -> " + staleSave);
+  check("冲突保存后另一实例的笔记仍在磁盘", fs.existsSync(otherFile), otherFile);
+
+  // 冲突会把 currentRev 刷到最新。若不冻结写链，排队中的旧快照就会用
+  //「新 rev + 旧内容」通过 CAS，反而把对方的改动盖掉 —— 强拦截必须覆盖整条写链。
+  const frozenSave = await S.save(baseSnap, false);
+  check("冲突后未重新载入时，后续保存仍被冻结", frozenSave === false, "S.save -> " + frozenSave);
+  check("冻结期间另一实例的笔记没被动过",
+    fs.existsSync(otherFile) && fs.readFileSync(otherFile, "utf8").includes("别删我"), otherFile);
+
+  // 模拟用户点「重新载入」：解冻写链、拿到新 rev 后，旧快照才能保存。
+  // 此时仍要用「未知 ≠ 要删」保证对方的笔记留在索引里。
+  await S.reload();
+  const resumed = await S.save(baseSnap, false);
+  check("重新载入后写链解冻，保存恢复成功", resumed === true, "S.save -> " + resumed);
   check("本实例保存旧快照后，另一实例的笔记仍在磁盘（未知 ≠ 要删）",
     fs.existsSync(otherFile), otherFile);
   const merged = await S.reload();
   check("本实例保存旧快照后，另一实例的笔记仍在索引里",
     !!(merged.data && merged.data.nodes && merged.data.nodes.some((n) => n.id === "other")),
     "nodes=" + (merged.data && merged.data.nodes ? merged.data.nodes.length : "null"));
+
+  /* ---------- 写盘串行化：连续两次 save 不能自己把自己锁出去 ----------
+   * 回归：0.8.13 前 writeNow 没有排队，两次 save 同时在飞时，第二次揣着
+   * 第一次推进前的旧 baseRev，被本实例自己的 CAS 拦下，弹出「另一个实例
+   * 修改过」的假冲突，还会连带把 UI 的自动保存永久暂停。 */
+  const concSnap = {
+    version: 2,
+    nodes: merged.data.nodes.map((n) => Object.assign({}, n)),
+    activeId: merged.data.activeId, expanded: merged.data.expanded || {}, view: "split",
+  };
+  const conflictsBefore = S.status().diag.filter((l) => l.includes("notes/save 冲突")).length;
+  const [c1, c2] = await Promise.all([S.save(concSnap, false), S.save(concSnap, false)]);
+  check("并发两次写盘都成功（写队列串行化，不产生自伤冲突）",
+    c1 === true && c2 === true, "save1=" + c1 + " save2=" + c2);
+  const conflictsAfter = S.status().diag.filter((l) => l.includes("notes/save 冲突")).length;
+  check("并发写没有新增乐观锁冲突日志", conflictsAfter === conflictsBefore,
+    "before=" + conflictsBefore + " after=" + conflictsAfter);
 
   // 正文文件读不到 → 必须标记 contentMissing，且绝不能回一个空串被原样写回（那等于清空笔记）
   fs.rmSync(otherFile);

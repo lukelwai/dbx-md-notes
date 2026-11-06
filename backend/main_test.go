@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,10 +31,10 @@ func TestSaveLoadRenameMove(t *testing.T) {
 	dir := t.TempDir()
 
 	snap := map[string]any{
-		"version":   2,
-		"activeId":  "n2",
-		"expanded":  map[string]bool{"n1": true},
-		"view":      "split",
+		"version":  2,
+		"activeId": "n2",
+		"expanded": map[string]bool{"n1": true},
+		"view":     "split",
 		"nodes": []map[string]any{
 			{"id": "n1", "type": "folder", "name": "示例", "parentId": nil, "content": "", "createdAt": "c", "updatedAt": "u"},
 			{"id": "n2", "type": "note", "name": "欢迎使用", "parentId": nil, "content": "# hello", "createdAt": "c", "updatedAt": "u"},
@@ -51,14 +52,16 @@ func TestSaveLoadRenameMove(t *testing.T) {
 	if _, err := os.Stat(childNote); err != nil {
 		t.Fatalf("child note file missing: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".mdnotes", "meta.json")); err != nil {
-		t.Fatalf("meta.json missing: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, ".mdnotes", "notes.db")); err != nil {
+		t.Fatalf("SQLite 索引 notes.db missing: %v", err)
 	}
 
-	// meta.json 不得包含正文
-	metaBytes, _ := os.ReadFile(filepath.Join(dir, ".mdnotes", "meta.json"))
+	// 索引里不得含正文（正文只在真实 .md 文件里）。用逻辑快照检查，
+	// 避免直接扫 .db 二进制时把页缓存里的历史字符串误判成正文。
+	setDir(dir)
+	metaBytes, _ := json.Marshal(loadMeta())
 	if contains(string(metaBytes), "child body") || contains(string(metaBytes), "# hello") {
-		t.Fatalf("meta.json must NOT contain note content, got:\n%s", metaBytes)
+		t.Fatalf("索引 must NOT contain note content, got: %s", metaBytes)
 	}
 
 	// load 应读回正文
@@ -183,7 +186,7 @@ func TestBackupReturnsBytesWithConfig(t *testing.T) {
 	}
 	joined := strings.Join(zipNames(t, raw), "\n")
 	// 配置随包走：元信息 + 目录树索引；只备份正文会恢复出一堆没名字没层级的孤儿文件。
-	for _, want := range []string{backupInfoName, backupMetaEntry, "A笔记.md", "示例/B笔记.md"} {
+	for _, want := range []string{backupInfoName, backupIndexEntry, "A笔记.md", "示例/B笔记.md"} {
 		if !contains(joined, want) {
 			t.Fatalf("备份包缺少 %s，实际条目：\n%s", want, joined)
 		}
@@ -312,7 +315,7 @@ func TestRestoreRejectsForeignZip(t *testing.T) {
 
 	raw, _ := json.Marshal(map[string]any{"storage_dir": t.TempDir(), "dataBase64": b64})
 	if _, perr := (&plugin{}).Handle(dbxpluginsdk.RequestContext{}, "notes/restore", raw, nil); perr == nil {
-		t.Fatalf("缺少 meta.json 的普通 zip 必须被拒绝")
+		t.Fatalf("缺少索引快照的普通 zip 必须被拒绝")
 	}
 }
 
@@ -323,7 +326,7 @@ func TestRestoreRejectsPathTraversal(t *testing.T) {
 	if w, e := zw.Create("../../evil.md"); e == nil {
 		_, _ = w.Write([]byte("pwn"))
 	}
-	if w, e := zw.Create(backupMetaEntry); e == nil {
+	if w, e := zw.Create(backupIndexEntry); e == nil {
 		_, _ = w.Write([]byte(`{"version":2,"nodes":[]}`))
 	}
 	_ = zw.Close()
@@ -367,19 +370,8 @@ func ptr(s string) *string { return &s }
 
 func metaNames(t *testing.T, dir string) map[string]string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(dir, ".mdnotes", "meta.json"))
-	if err != nil {
-		t.Fatalf("读 meta 失败：%v", err)
-	}
-	var m struct {
-		Nodes []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"nodes"`
-	}
-	if err := json.Unmarshal(b, &m); err != nil {
-		t.Fatalf("解析 meta 失败：%v", err)
-	}
+	setDir(dir)
+	m := loadMeta()
 	out := map[string]string{}
 	for _, n := range m.Nodes {
 		out[n.ID] = n.Name
@@ -554,4 +546,122 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------- 已删除笔记：统计与备份都不该带上（0.8.14 回归） ----------------
+//
+// 现场复现：索引里残留「正文已不在原位」的节点。以前 notes/load 只标 contentMissing
+// 却仍把节点返回给前端（左下角统计虚高），备份又为它们写出空 .md 条目。
+func TestDeletedNotesExcludedFromLoadAndBackup(t *testing.T) {
+	dir := t.TempDir()
+	setDir(dir)
+	defer setDir(dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "还在的笔记.md"), []byte("# 正文 A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟插件删除后在回收站留下的痕迹（索引节点却没同步删掉）
+	trashDst := trashPath(dir, "已删进回收站.md")
+	if err := os.MkdirAll(filepath.Dir(trashDst), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trashDst, []byte("# 正文 B"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 把一份「脏索引」灌进 SQLite：活笔记 / 已删 / 内部残留 / 外部移走 各一条
+	dirty := Meta{Version: 2, ActiveID: "alive", View: "split", Nodes: []MetaNode{
+		{ID: "alive", Type: "note", Name: "还在的笔记", File: "还在的笔记.md"},
+		{ID: "gone", Type: "note", Name: "已删进回收站", File: "已删进回收站.md"},
+		{ID: "internal", Type: "note", Name: "回收站被误登记", File: ".mdnotes/trash/20260101-000000/老笔记.md"},
+		{ID: "moved", Type: "note", Name: "被外部移走", File: "被外部移走.md"},
+	}}
+	if err := saveMeta(dirty); err != nil {
+		t.Fatalf("灌入脏索引失败：%v", err)
+	}
+	if got := len(loadMeta().Nodes); got != 4 {
+		t.Fatalf("前提：SQLite 里应有 4 个节点，实际 %d", got)
+	}
+
+	// 1) 读索引：只该剩「活笔记」+「外部移走但没有删除痕迹」两条
+	live, dead := liveMeta(loadMeta())
+	if len(live.Nodes) != 2 || len(dead) != 2 {
+		t.Fatalf("应过滤 2 条已删除节点、保留 2 条，实际 live=%d dead=%d", len(live.Nodes), len(dead))
+	}
+	if !dead["gone"] || !dead["internal"] {
+		t.Fatalf("判死的应该是 gone / internal，实际 %v", dead)
+	}
+	pl, perr := notesLoad()
+	if perr != nil {
+		t.Fatalf("notesLoad 失败：%v", perr)
+	}
+	loaded := pl.(map[string]any)["data"].(map[string]any)["nodes"].([]map[string]any)
+	if len(loaded) != 2 {
+		t.Fatalf("notes/load 应只返回 2 个节点（统计才不会虚高），实际 %d", len(loaded))
+	}
+	for _, n := range loaded {
+		if n["id"] == "moved" && n["contentMissing"] != true {
+			t.Fatalf("外部移走的笔记必须保留并按 contentMissing 冻结：%v", n)
+		}
+	}
+
+	// 2) 备份：包里不能有已删除笔记，索引快照也必须是干净的（否则恢复后会「复活」）
+	bk, berr := backupNotes("", false)
+	if berr != nil {
+		t.Fatalf("backupNotes 失败：%v", berr.Message)
+	}
+	if bk.(map[string]any)["count"] != 1 {
+		t.Fatalf("备份回显的笔记数只该算正文真实存在的，实际 %v", bk.(map[string]any)["count"])
+	}
+	raw, err := base64.StdEncoding.DecodeString(bk.(map[string]any)["dataBase64"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	var idxFile *zip.File
+	for _, f := range zr.File {
+		names[f.Name] = true
+		if f.Name == backupIndexEntry {
+			idxFile = f
+		}
+	}
+	if names["已删进回收站.md"] || names[".mdnotes/trash/20260101-000000/老笔记.md"] || names["被外部移走.md"] {
+		t.Fatalf("已删除 / 正文读不到的笔记都不该进备份包：%v", names)
+	}
+	if !names["还在的笔记.md"] {
+		t.Fatalf("活笔记必须进备份包：%v", names)
+	}
+	if idxFile == nil {
+		t.Fatalf("备份包缺少 %s", backupIndexEntry)
+	}
+	rc, _ := idxFile.Open()
+	idxBytes, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	var idx Meta
+	if err := json.Unmarshal(idxBytes, &idx); err != nil {
+		t.Fatalf("索引快照解析失败：%v", err)
+	}
+	if len(idx.Nodes) != 1 || idx.Nodes[0].ID != "alive" {
+		t.Fatalf("备份里的索引快照只该含正文真实存在的笔记，实际 %v", idx.Nodes)
+	}
+
+	// 3) 自愈：一次正常保存后，死节点真的从 SQLite 消失；外部移走的仍在
+	call(t, "notes/save", map[string]any{"storage_dir": dir, "data": map[string]any{
+		"version": 2,
+		"nodes": []map[string]any{
+			{"id": "alive", "type": "note", "name": "还在的笔记", "parentId": nil, "content": "# 正文 A"},
+			{"id": "moved", "type": "note", "name": "被外部移走", "parentId": nil},
+		},
+	}})
+	after := loadMeta()
+	if metaNodeByID(after, "gone") != nil || metaNodeByID(after, "internal") != nil {
+		t.Fatalf("保存后已删除节点应被真正清掉：%v", after.Nodes)
+	}
+	if metaNodeByID(after, "moved") == nil {
+		t.Fatalf("外部移走的笔记不该被误删")
+	}
 }

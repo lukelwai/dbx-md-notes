@@ -58,7 +58,7 @@
 
   /* ============ 诊断日志（页面置顶诊断条 + 状态弹窗共用，实时刷新） ============ */
 
-  var UI_VERSION = "0.8.12";   // 打包脚本会校验它与 manifest.version 一致
+  var UI_VERSION = "0.8.14";   // 打包脚本会校验它与 manifest.version 一致
   var T0 = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
   /** 自模块加载起的毫秒数（给每条日志打上相对时间，能看出卡在哪一步） */
   function since() {
@@ -171,7 +171,8 @@
     fsSupported: false,
     folderName: "",
     backupOnly: false,      // true = 仅会话内缓存，未真正落盘
-    payloadBytes: 0         // 最近一次 save 的负载大小
+    payloadBytes: 0,        // 最近一次 save 的负载大小
+    rev: 0                  // SQLite 索引的全局修订号（乐观锁用）
   };
 
   function emit() {
@@ -409,6 +410,21 @@
   var current = null;
   var flushTimer = null;
   var pendingData = null;
+  /** 写盘串行链：乐观锁要求每次 notes/save 都带「发出当时最新的 rev」 */
+  var writeChain = Promise.resolve();
+  /** 真冲突后冻结整条写链，直到显式 reload 读到最新数据才解冻 */
+  var conflictLatch = false;
+
+  /* ---- 乐观锁：全局 rev + 冲突通知 ----
+   * currentRev 是「本实例最后一次读到/写出的全局修订号」。每次 save 都把它作为
+   * baseRev 带上；侧车若发现库里的 rev 已经变了（别的实例写过），会拒绝整次保存。
+   * 冲突不是连接故障，绝不能走 writeNow 的「重连再重试」分支。 */
+  var currentRev = 0;
+  var conflictHandler = null;
+  function setRev(v) {
+    if (typeof v === "number" && v > 0) { currentRev = v; setStatus({ rev: v }); }
+  }
+  function readRev(pl) { if (pl && typeof pl.rev === "number") { setRev(pl.rev); } }
 
   function readCurrent() {
     if (!current) { current = memoryBackend(); }
@@ -456,6 +472,8 @@
         storageDir: nonEmptyStr(pl.dir) || status.storageDir,
         dirConfigured: pl.configured === true
       });
+      readRev(pl);
+      conflictLatch = false;
       return {
         data: (pl.data && typeof pl.data === "object") ? pl.data : null,
         pending: pl.pending || null,
@@ -625,6 +643,8 @@
             storageDir: nonEmptyStr(pl.dir) || status.storageDir,
             dirConfigured: pl.configured === true
           });
+          readRev(pl);
+          conflictLatch = false;  // 重新载入 = 解冻写链
           return { data: pl.data || null, pending: pl.pending || null };
         });
       },
@@ -638,14 +658,31 @@
           return Promise.reject(new Error(over));
         }
         var extra = { data: data };
+        // 把本次保存基于的 rev 塞进快照；侧车用它做 CAS。
+        if (currentRev > 0 && data && typeof data === "object") {
+          extra.data = {};
+          for (var k in data) { if (Object.prototype.hasOwnProperty.call(data, k)) { extra.data[k] = data[k]; } }
+          extra.data.baseRev = currentRev;
+        }
         if (client && client.storageDir) { extra.storage_dir = client.storageDir; }
         return rpc("notes/save", extra, RPC_TIMEOUT).then(function (pl) {
+          if (pl && pl.conflict === true) {
+            if (typeof pl.currentRev === "number") { setRev(pl.currentRev); }
+            conflictLatch = true;   // 冻结写链，直到 reload 读到最新数据
+            var cerr = new Error(pl.message || "笔记已被其他实例修改，本次保存已阻止。");
+            cerr.isConflict = true;
+            cerr.detail = pl;
+            if (conflictHandler) { try { conflictHandler(pl); } catch (e) { /* ignore */ } }
+            note("notes/save 冲突", false, cerr.message);
+            throw cerr;
+          }
           if (pl && typeof pl === "object") {
             setStatus({
               storagePath: nonEmptyStr(pl.path) || status.storagePath,
               storageDir: nonEmptyStr(pl.dir) || status.storageDir,
               dirConfigured: true
             });
+            readRev(pl);
           }
           note("notes/save", true,
             Math.round(bytes / 1024) + " KB -> " + (status.storagePath || "（侧车未回报路径）"));
@@ -929,6 +966,12 @@
     /** 上行（前端 → 侧车）单次文件大小上限，见 MAX_UPSTREAM_BYTES 注释 */
     MAX_UPSTREAM_BYTES: MAX_UPSTREAM_BYTES,
 
+    /** 注册冲突回调：保存被别处的写入挡下时调用，UI 据此提示并暂停自动保存 */
+    onConflict: function (fn) { conflictHandler = (typeof fn === "function") ? fn : null; },
+
+    /** 当前全局修订号（诊断用） */
+    rev: function () { return currentRev; },
+
     /** 写入。debounce=true 时合并短时间内的多次写入 */
     save: function (data, debounce) {
       if (debounce) {
@@ -947,38 +990,60 @@
       pendingData = null;
       if (!current) { current = memoryBackend(); }
       var target = current;
-      return Promise.resolve().then(function () {
-        return target.write(data);
-      }).then(function () {
-        setStatus({
-          ok: true, lastError: "", lastSavedAt: Date.now(),
-          backend: target.name, persistent: target.persistent,
-          available: target.name !== "memory",
-          backupOnly: target.name === "memory"
-        });
-        return true;
-      }).catch(function (err) {
-        // 侧车写失败：尝试重连一次再重试（宿主可能重启过侧车）
-        if (target.name === "sidecar") {
-          return settle(withTimeout(rpc("notes/ping", {}, PING_TIMEOUT), PING_TIMEOUT + 500, "重连侧车"))
-            .then(function (r) {
-              if (r.ok) { return target.write(data); }
-              throw err;
-            }).then(function () {
-              setStatus({ ok: true, lastError: "", lastSavedAt: Date.now() });
-              return true;
-            }).catch(function (again) {
-              var msg = errText(again || err);
-              setStatus({ ok: false, lastError: msg, sidecarAvailable: false, sidecarError: msg });
-              note("notes/save", false, msg);
-              return false;
-            });
+      // 写盘必须串行：若两次 save 同时在飞，后一次带着前一次推进前的旧 baseRev，
+      // 会被自己的乐观锁拦下，弹出「另一个实例修改过」的假冲突。
+      // 排进链后，target.write() 直到轮到自己才执行，那时读到的 currentRev 已是最新的。
+      var run = function () {
+        if (conflictLatch) {
+          // 一次真冲突会把 currentRev 刷到最新；若放行排队中的旧快照，
+          // 它会用「新 rev + 旧内容」通过 CAS，反而把对方的改动盖掉。
+          // 所以冲突后整条写链都冻结，只有显式 reload 才解冻。
+          return Promise.resolve(false);
         }
-        var m = errText(err);
-        setStatus({ ok: false, lastError: m });
-        note("写入笔记", false, m);
-        return false;
-      });
+        return Promise.resolve().then(function () {
+          return target.write(data);
+        }).then(function () {
+          setStatus({
+            ok: true, lastError: "", lastSavedAt: Date.now(),
+            backend: target.name, persistent: target.persistent,
+            available: target.name !== "memory",
+            backupOnly: target.name === "memory"
+          });
+          return true;
+        }).catch(function (err) {
+          // 乐观锁冲突是【逻辑冲突】，不是连接故障：重连重试只会再冲突一次，
+          // 而且会反复触发提示。直接失败，等用户重新载入后再编辑。
+          if (err && err.isConflict) {
+            var cmsg = errText(err);
+            setStatus({ ok: false, lastError: cmsg });
+            return false;
+          }
+          // 侧车写失败：尝试重连一次再重试（宿主可能重启过侧车）
+          if (target.name === "sidecar") {
+            return settle(withTimeout(rpc("notes/ping", {}, PING_TIMEOUT), PING_TIMEOUT + 500, "重连侧车"))
+              .then(function (r) {
+                if (r.ok) { return target.write(data); }
+                throw err;
+              }).then(function () {
+                setStatus({ ok: true, lastError: "", lastSavedAt: Date.now() });
+                return true;
+              }).catch(function (again) {
+                var msg = errText(again || err);
+                setStatus({ ok: false, lastError: msg, sidecarAvailable: false, sidecarError: msg });
+                note("notes/save", false, msg);
+                return false;
+              });
+          }
+          var m = errText(err);
+          setStatus({ ok: false, lastError: m });
+          note("写入笔记", false, m);
+          return false;
+        });
+      };
+      var result = writeChain.then(run, run);
+      // 无论成功失败都让链继续，不能因为一次冲突把后续写入全卡死。
+      writeChain = result.then(function () { return true; }, function () { return true; });
+      return result;
     },
 
     flush: function () {

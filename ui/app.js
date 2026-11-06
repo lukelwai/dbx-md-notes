@@ -64,7 +64,9 @@
     deletedIds: [],
     // 正文没读上来的笔记 id：这类笔记【不许】把正文写回（会把磁盘上的正文清空）。
     // 由 notes/load 的 contentMissing 标记填充。
-    contentMissing: {}
+    contentMissing: {},
+    // 乐观锁冲突后暂停自动保存，等用户重新载入（避免旧快照反复被拒、反复弹提示）
+    conflict: false
   };
   var manualTheme = null;
   var configuredDir = "";   // 连接表单里填的「笔记存储目录」（宿主传入，前端只能读不能写）
@@ -100,7 +102,9 @@
   function countNotes(pid) {
     var total = 0;
     childrenOf(pid).forEach(function (n) {
-      if (n.type === "note") { total++; } else { total += countNotes(n.id); }
+      // 与侧栏统计保持一致：正文读不到的冻结空壳不计入笔记数。
+      if (n.type === "note") { if (!n.contentMissing) { total++; } }
+      else { total += countNotes(n.id); }
     });
     return total;
   }
@@ -158,7 +162,7 @@
     };
   }
   function persist(debounce) {
-    if (!state.loaded) { return; }
+    if (!state.loaded || state.conflict) { return; }
     S.save(snapshot(), debounce !== false);
   }
 
@@ -187,6 +191,9 @@
   function applyLoaded(res) {
     var d = (res && res.data) ? res.data : res;
     if (!d || Object.prototype.toString.call(d.nodes) !== "[object Array]") { return false; }
+    // 任何一次成功载入都代表已拿到最新 rev：同步解除 UI 侧的冲突暂停，
+    // 与存储层 reload 时解冻写链保持一致（切换目录 / 恢复备份也走这里）。
+    state.conflict = false;
     state.nodes = d.nodes;
     state.activeId = d.activeId || null;
     state.expanded = d.expanded || {};
@@ -283,6 +290,52 @@
     parent.appendChild(wrap);
     return wrap;
   }
+  /* ---------------- 乐观锁冲突 ----------------
+   * 侧车发现「本实例基于的 rev 已过期」时会拒绝整次保存。这里暂停自动保存，
+   * 用自定义浮层解释原因并提供「重新载入」入口 —— 沙箱里 window.confirm 被拦，
+   * 且冲突后继续用旧快照保存只会一直被拒。 */
+  function showConflict(pl) {
+    if (state.conflict) { return; }   // 已提示过，别叠弹窗
+    state.conflict = true;
+    var changed = (pl && pl.changed) || [];
+    var sample = changed.slice(0, 3).map(function (c) { return c.name || c.id; }).join("、");
+    openModal(function (card) {
+      var h = document.createElement("h3");
+      h.textContent = "检测到其他窗口修改了笔记";
+      card.appendChild(h);
+      var p1 = document.createElement("p");
+      p1.textContent = "这个存储目录同时被另一个插件实例使用，对方已经写入了新内容。"
+        + "为避免覆盖，本次保存已被阻止。请重新载入后再继续编辑。";
+      card.appendChild(p1);
+      if (sample) {
+        var p2 = document.createElement("p");
+        p2.textContent = "发生变化的笔记：" + sample
+          + (changed.length > 3 ? " 等 " + changed.length + " 条" : "");
+        card.appendChild(p2);
+      }
+      var p3 = document.createElement("p");
+      p3.textContent = "本窗口的未保存修改不会被丢弃，但重新载入后需要用新内容为准。";
+      card.appendChild(p3);
+      modalButtons(card, [
+        { text: "暂不处理", onClick: function () { closeModal(); } },
+        { text: "重新载入", primary: true, onClick: function () {
+            closeModal();
+            S.reload().then(function (data) {
+              state.conflict = false;
+              if (applyLoaded(data)) { render(); }
+              renderStatus();
+              toast("已重新载入最新笔记，可以继续编辑");
+            }).catch(function (e) {
+              // 载入失败就【保持冻结】：此时存储层的写链仍是锁住的，
+              // 若在这里解冻 UI，用户继续编辑只会得到一次次静默的保存失败。
+              toast("重新载入失败，写入仍已暂停：" + (e && e.message ? e.message : e)
+                + "。请稍后重试或刷新页面。", "warn");
+            });
+          } }
+      ]);
+    });
+  }
+
   function promptModal(title, label, value, okText) {
     return new Promise(function (resolve) {
       var input;
@@ -869,7 +922,11 @@
     var st = S.status();
     var totalNotes = 0, totalFolders = 0;
     state.nodes.forEach(function (n) {
-      if (n.type === "note") { totalNotes++; } else { totalFolders++; }
+      if (n.type === "note") {
+        // 正文读不到的节点是「已删除 / 被外部移走」的空壳，后端已把它冻结。
+        // 它不该算进「我有几篇笔记」，否则删过的笔记会让统计只增不减。
+        if (!n.contentMissing) { totalNotes++; }
+      } else { totalFolders++; }
     });
     foot.textContent = "";
 
@@ -3156,6 +3213,8 @@
       S.log("调用存储 init()", false, "未返回 Promise（存储层可能未正确加载）");
       return;
     }
+
+    S.onConflict(showConflict);
 
     initResult.then(function (res) {
       readConfiguredDir();

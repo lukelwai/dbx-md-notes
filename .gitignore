@@ -29,3 +29,8 @@ _gocache/
 _gotmp/
 _tmp7z/
 _layout_progress.txt
+# 一次性探针/清理产物（可随时再生）
+_gocache_clean/
+backend/*.bak
+# 依赖快照由 `go mod vendor` 本地生成，不入库；换环境需重建
+backend/vendor/
